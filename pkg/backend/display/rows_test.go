@@ -88,6 +88,28 @@ func TestResourceRowDataColorizedColumns(t *testing.T) {
 	}
 }
 
+func TestStateMigrationDescription(t *testing.T) {
+	t.Parallel()
+
+	left := resource.URN("urn:pulumi:test::test::example:index:Component$example:index:Part::left")
+	right := resource.URN("urn:pulumi:test::test::example:index:Component$example:index:Part::right")
+	unified := resource.URN("urn:pulumi:test::test::example:index:Component$example:index:Part::unified")
+	payload := engine.StateMigrationEventPayload{
+		Added: []resource.URN{unified},
+		Successors: map[resource.URN]resource.URN{
+			right: unified,
+			left:  unified,
+		},
+	}
+
+	require.Equal(t, "state migrated: left, right → unified",
+		stateMigrationDescription(payload, Options{}))
+	require.Equal(t, "state migrated: "+string(left)+", "+string(right)+" → "+string(unified),
+		stateMigrationDescription(payload, Options{ShowURNs: true}))
+	require.Equal(t, "state migrated",
+		stateMigrationDescription(engine.StateMigrationEventPayload{}, Options{}))
+}
+
 func TestResourceRowDataInterruptedStatus(t *testing.T) {
 	t.Parallel()
 
