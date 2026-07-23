@@ -107,6 +107,7 @@ type ContinueResourceRefreshEvent interface {
 	RegisterResourceEvent
 
 	URN() resource.URN
+	Original() *pkgresource.State
 	Old() *pkgresource.State
 	New() *pkgresource.State
 	Invalid() bool
@@ -115,11 +116,12 @@ type ContinueResourceRefreshEvent interface {
 
 type continueResourceRefreshEvent struct {
 	RegisterResourceEvent
-	urn     resource.URN       // the URN of the resource being processed.
-	old     *pkgresource.State // the old state of the resource being processed.
-	new     *pkgresource.State // the new state of the resource being processed.
-	invalid bool               // whether the resource is invalid.
-	err     error              // any error that occurred during refresh
+	urn      resource.URN       // the URN of the resource being processed.
+	original *pkgresource.State // the state before the refresh.
+	old      *pkgresource.State // the refreshed old state of the resource being processed.
+	new      *pkgresource.State // the new state of the resource being processed.
+	invalid  bool               // whether the resource is invalid.
+	err      error              // any error that occurred during refresh
 }
 
 var _ ContinueResourceRefreshEvent = (*continueResourceRefreshEvent)(nil)
@@ -128,6 +130,10 @@ func (g *continueResourceRefreshEvent) event() {}
 
 func (g *continueResourceRefreshEvent) URN() resource.URN {
 	return g.urn
+}
+
+func (g *continueResourceRefreshEvent) Original() *pkgresource.State {
+	return g.original
 }
 
 func (g *continueResourceRefreshEvent) Old() *pkgresource.State {
@@ -155,7 +161,6 @@ type ContinueResourceImportEvent interface {
 	URN() resource.URN
 	New() *pkgresource.State
 	Old() *pkgresource.State
-	Provider() plugin.Provider
 	Invalid() bool
 	Recreating() bool
 	RandomSeed() []byte
@@ -168,7 +173,6 @@ type continueResourceImportEvent struct {
 	urn        resource.URN // the URN of the resource being processed.
 	old        *pkgresource.State
 	new        *pkgresource.State
-	provider   plugin.Provider
 	invalid    bool
 	recreating bool
 	randomSeed []byte
@@ -195,10 +199,6 @@ func (g *continueResourceImportEvent) Old() *pkgresource.State {
 
 func (g *continueResourceImportEvent) New() *pkgresource.State {
 	return g.new
-}
-
-func (g *continueResourceImportEvent) Provider() plugin.Provider {
-	return g.provider
 }
 
 func (g *continueResourceImportEvent) Invalid() bool {

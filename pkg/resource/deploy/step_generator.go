@@ -91,9 +91,6 @@ type stepGenerator struct {
 	// stepExecLock pauses the step executor while the deployment's base state is rewritten by a state
 	// migration. Set by the deployment executor; may be nil in tests that drive the step generator directly.
 	stepExecLock sync.Locker
-	// refreshAliasLock protects dependency-graph alias updates performed by asynchronous refresh completion.
-	// It is removed once those updates are moved back onto the step-generator goroutine.
-	refreshAliasLock sync.Mutex
 
 	// A map of original state which will be what's seen by the snapshot system to their new refreshed state.
 	refreshStates map[*pkgresource.State]*pkgresource.State
@@ -290,8 +287,10 @@ func (sg *stepGenerator) generateURN(
 // GenerateReadSteps is responsible for producing one or more steps required to service
 // a ReadResourceEvent coming from the language host.
 func (sg *stepGenerator) GenerateReadSteps(event ReadResourceEvent) ([]Step, error) {
+	parent := sg.deployment.rewriteStateMigrationURN(event.Parent())
+
 	// Some event settings are based on the parent settings so make sure our parent is correct.
-	parent, err := sg.checkParent(event.Parent(), event.Type())
+	parent, err := sg.checkParent(parent, event.Type())
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +344,11 @@ func (sg *stepGenerator) GenerateReadSteps(event ReadResourceEvent) ([]Step, err
 		ResourceHooks:           nil,
 		SnippetID:               "",
 	}.Make()
+	rewritten, err := sg.deployment.rewriteStateMigrationResources([]*pkgresource.State{newState})
+	if err != nil {
+		return nil, fmt.Errorf("normalizing read state for %s after state migration: %w", urn, err)
+	}
+	newState = rewritten[0]
 
 	if newState.ID == "" {
 		return nil, fmt.Errorf("Expected an ID for %v", urn)
@@ -636,12 +640,25 @@ func (sg *stepGenerator) generateAliases(
 	return result
 }
 
+// generateCanonicalAliases resolves registration aliases through state migrations that committed earlier in the
+// update. A program may continue to name a predecessor URN even though a migration has already replaced that state
+// with its successor in the deployment's old-resource map.
+func (sg *stepGenerator) generateCanonicalAliases(
+	name string, typ tokens.Type, parent resource.URN, resAliases []resource.Alias,
+) []resource.URN {
+	aliases := sg.generateAliases(name, typ, parent, resAliases)
+	for i, alias := range aliases {
+		aliases[i] = sg.deployment.rewriteStateMigrationURN(alias)
+	}
+	return aliases
+}
+
 func (sg *stepGenerator) getOldResource(
 	urn resource.URN, name string, typ tokens.Type, parent resource.URN, resAliases []resource.Alias,
 ) (*pkgresource.State, bool, resource.URN) {
 	invalid := false
 	// Generate the aliases for this resource.
-	aliases := sg.generateAliases(name, typ, parent, resAliases)
+	aliases := sg.generateCanonicalAliases(name, typ, parent, resAliases)
 	// Log the aliases we're going to use to help with debugging aliasing issues.
 	logging.V(7).Infof("Generated aliases for %s: %v", urn, aliases)
 
@@ -699,8 +716,10 @@ func (sg *stepGenerator) getOldResource(
 func (sg *stepGenerator) generateSteps(ctx context.Context, event RegisterResourceEvent) ([]Step, bool, error) {
 	goal := event.Goal()
 
+	parent := sg.deployment.rewriteStateMigrationURN(goal.Parent)
+
 	// Some goal settings are based on the parent settings so make sure our parent is correct.
-	parent, err := sg.checkParent(goal.Parent, goal.Type)
+	parent, err := sg.checkParent(parent, goal.Type)
 	if err != nil {
 		return nil, false, err
 	}
@@ -832,6 +851,11 @@ func (sg *stepGenerator) generateResourceSteps(
 		ResourceHooks:           goal.ResourceHooks,
 		SnippetID:               goal.SnippetID,
 	}.Make()
+	rewritten, err := sg.deployment.rewriteStateMigrationResources([]*pkgresource.State{new})
+	if err != nil {
+		return nil, false, fmt.Errorf("normalizing resource state for %s after state migration: %w", urn, err)
+	}
+	new = rewritten[0]
 	if sdkproviders.IsProviderType(goal.Type) {
 		sg.providers[urn] = new
 		for _, aliasURN := range aliasUrns {
@@ -853,17 +877,10 @@ func (sg *stepGenerator) generateResourceSteps(
 			// if promise had an "ContinueWith" like method to run code after a promise resolved we'd use it here,
 			// but a goroutine blocked on Result and then posting to a channel is very cheap.
 			state, err := cts.Promise().Result(context.Background())
-			// alias this new "old" state in the dependency graph to it's original state.
-			if state != nil {
-				// This mutates depGraph but this in a goroutine so might race other Alias calls so we need to lock around this.
-				sg.refreshAliasLock.Lock()
-				sg.deployment.depGraph.Alias(state, old)
-				sg.refreshStates[old] = state
-				sg.refreshAliasLock.Unlock()
-			}
 			sg.events <- &continueResourceRefreshEvent{
 				RegisterResourceEvent: event,
 				urn:                   urn,
+				original:              old,
 				old:                   state,
 				new:                   new,
 				invalid:               invalid,
@@ -888,6 +905,7 @@ func (sg *stepGenerator) generateResourceSteps(
 	continueEvent := &continueResourceRefreshEvent{
 		RegisterResourceEvent: event,
 		urn:                   urn,
+		original:              old,
 		old:                   old,
 		new:                   new,
 		invalid:               invalid,
@@ -981,6 +999,19 @@ func (sg *stepGenerator) continueStepsFromRefresh(
 	if err != nil {
 		return nil, false, err
 	}
+	if err := sg.deployment.rewriteStateMigrationState(event.Old()); err != nil {
+		return nil, false, fmt.Errorf("normalizing refreshed state for %s after state migration: %w", urn, err)
+	}
+	if err := sg.deployment.rewriteStateMigrationState(event.New()); err != nil {
+		return nil, false, fmt.Errorf("normalizing desired state for %s after state migration: %w", urn, err)
+	}
+
+	// Refresh completion is observed on the step-generator goroutine. Keep dependency-graph and refresh-state
+	// bookkeeping here as well, so it cannot race a state migration rebuilding the graph.
+	if original := event.Original(); original != nil && old != nil && original != old {
+		sg.deployment.depGraph.Alias(old, original)
+		sg.refreshStates[original] = old
+	}
 
 	// If this is a refresh deployment we're _always_ going to do a skip create or refresh step here for
 	// custom non-provider resources. We also need to skip refreshes for custom provider resources if they
@@ -1065,8 +1096,7 @@ func (sg *stepGenerator) continueStepsFromRefresh(
 	}
 
 	// Fetch the provider for this resource.
-	prov, err := sg.loadResourceProvider(urn, goal.Custom, goal.Provider, goal.Type)
-	if err != nil {
+	if _, err := sg.loadResourceProvider(urn, goal.Custom, new.Provider, goal.Type); err != nil {
 		return nil, false, err
 	}
 
@@ -1174,7 +1204,6 @@ func (sg *stepGenerator) continueStepsFromRefresh(
 				urn:                   urn,
 				old:                   old,
 				new:                   newnew,
-				provider:              prov,
 				invalid:               event.Invalid(),
 				recreating:            recreating,
 				randomSeed:            randomSeed,
@@ -1198,7 +1227,6 @@ func (sg *stepGenerator) continueStepsFromRefresh(
 		urn:                   urn,
 		old:                   old,
 		new:                   new,
-		provider:              prov,
 		invalid:               event.Invalid(),
 		recreating:            recreating,
 		randomSeed:            randomSeed,
@@ -1239,7 +1267,6 @@ func (sg *stepGenerator) continueStepsFromImport(
 	urn := event.URN()
 	old := event.Old()
 	new := event.New()
-	prov := event.Provider()
 	invalid := event.Invalid()
 	recreating := event.Recreating()
 	randomSeed := event.RandomSeed()
@@ -1250,6 +1277,20 @@ func (sg *stepGenerator) continueStepsFromImport(
 	err := event.Error()
 	if err != nil {
 		return nil, false, nil
+	}
+	if err := sg.deployment.rewriteStateMigrationState(old); err != nil {
+		return nil, false, fmt.Errorf("normalizing imported state for %s after state migration: %w", urn, err)
+	}
+	if err := sg.deployment.rewriteStateMigrationState(new); err != nil {
+		return nil, false, fmt.Errorf("normalizing desired state for %s after state migration: %w", urn, err)
+	}
+	// Some Check paths intentionally ignore old/defaulted inputs and start again from the program's desired inputs.
+	// Preserve that input set after migration normalization so those paths do not reintroduce predecessor references
+	// from goal.Properties.
+	normalizedGoalInputs := new.Inputs
+	prov, err := sg.loadResourceProvider(urn, goal.Custom, new.Provider, goal.Type)
+	if err != nil {
+		return nil, false, err
 	}
 
 	inputs := new.Inputs
@@ -1316,7 +1357,7 @@ func (sg *stepGenerator) continueStepsFromImport(
 		if recreating || wasExternal || sg.isTargetedReplace(urn, old) || old == nil {
 			resp, err = checkInputs(context.TODO(), plugin.CheckRequest{
 				URN:           urn,
-				News:          resource.ToResourcePropertyMap(goal.Properties),
+				News:          normalizedGoalInputs,
 				AllowUnknowns: allowUnknowns,
 				RandomSeed:    randomSeed,
 				Autonaming:    autonaming,
@@ -1339,6 +1380,10 @@ func (sg *stepGenerator) continueStepsFromImport(
 			invalid = true
 		}
 		new.Inputs = inputs
+		if err := sg.deployment.rewriteStateMigrationState(new); err != nil {
+			return nil, false, fmt.Errorf("normalizing checked inputs for %s after state migration: %w", urn, err)
+		}
+		inputs = new.Inputs
 	}
 
 	// If the resource is valid and we're generating plans then generate a plan
@@ -1447,6 +1492,10 @@ func (sg *stepGenerator) continueStepsFromImport(
 				new.Inputs = resource.ToResourcePropertyMap(tresult.Properties)
 			}
 		}
+		if err := sg.deployment.rewriteStateMigrationState(new); err != nil {
+			return nil, false, fmt.Errorf("normalizing remediated inputs for %s after state migration: %w", urn, err)
+		}
+		inputs = new.Inputs
 		summary := resourceanalyzer.NewRemediatePolicySummary(new.URN, response, info)
 		sg.deployment.events.OnPolicyRemediateSummary(summary)
 	}
@@ -1792,7 +1841,7 @@ func (sg *stepGenerator) generateStepsFromDiff(
 	triggerReplace := shouldTriggerReplace(new.ReplacementTrigger, old.ReplacementTrigger)
 
 	var diff plugin.DiffResult
-	var pcs *promise.CompletionSource[plugin.DiffResult]
+	var pcs *promise.CompletionSource[diffStepResult]
 	var err error
 	if triggerReplace {
 		// Return that there is a diff, but don't fill in any details. We later
@@ -1856,8 +1905,7 @@ func (sg *stepGenerator) ContinueStepsFromDiff(event ContinueResourceDiffEvent) 
 		return nil, err
 	}
 
-	updateSteps, err = sg.validateSteps(updateSteps)
-	return updateSteps, err
+	return sg.validateSteps(updateSteps)
 }
 
 // continueStepsFromDiff continues the process of generating steps for a resource after the diff has been computed
@@ -1876,6 +1924,11 @@ func (sg *stepGenerator) continueStepsFromDiff(diffEvent ContinueResourceDiffEve
 	autonaming := diffEvent.Autonaming()
 	event := diffEvent.Event()
 	goal := event.Goal()
+	normalizedGoal := &pkgresource.State{Inputs: resource.ToResourcePropertyMap(goal.Properties)}
+	if err := sg.deployment.rewriteStateMigrationState(normalizedGoal); err != nil {
+		return nil, fmt.Errorf("normalizing replacement inputs for %s after state migration: %w", urn, err)
+	}
+	normalizedGoalInputs := normalizedGoal.Inputs
 
 	// If we try to return zero steps change it to one same step
 	defer func() {
@@ -1995,7 +2048,7 @@ func (sg *stepGenerator) continueStepsFromDiff(diffEvent ContinueResourceDiffEve
 			if prov != nil && !sg.isTargetedReplace(urn, old) {
 				resp, err := prov.Check(context.TODO(), plugin.CheckRequest{
 					URN:           urn,
-					News:          resource.ToResourcePropertyMap(goal.Properties),
+					News:          normalizedGoalInputs,
 					AllowUnknowns: allowUnknowns,
 					RandomSeed:    randomSeed,
 					Autonaming:    autonaming,
@@ -2832,7 +2885,7 @@ func (sg *stepGenerator) diff(
 	goal *pkgresource.Goal, autonaming *plugin.AutonamingOptions, randomSeed []byte,
 	urn resource.URN, old, new *pkgresource.State, oldInputs,
 	newInputs resource.PropertyMap, prov plugin.Provider,
-) (plugin.DiffResult, *promise.CompletionSource[plugin.DiffResult], error) {
+) (plugin.DiffResult, *promise.CompletionSource[diffStepResult], error) {
 	// If this resource is marked for replacement, just return a "replace" diff that blames the id.
 	if sg.isTargetedReplace(urn, old) {
 		return plugin.DiffResult{Changes: plugin.DiffSome, ReplaceKeys: []resource.PropertyKey{"id"}}, nil, nil
@@ -2886,15 +2939,18 @@ func (sg *stepGenerator) diff(
 	}
 
 	// Else setup a promise for it so our caller will yield a DiffStep.
-	pcs := &promise.CompletionSource[plugin.DiffResult]{}
+	pcs := &promise.CompletionSource[diffStepResult]{}
 	go PanicRecovery(sg.deployment.panicErrs, func() {
 		// if promise had an "ContinueWith" like method to run code after a promise resolved we'd use it here,
 		// but a goroutine blocked on Result and then posting to a channel is very cheap.
-		diff, err := pcs.Promise().Result(context.Background())
+		result, err := pcs.Promise().Result(context.Background())
+		if err == nil {
+			err = result.err
+		}
 		sg.events <- &continueDiffResourceEvent{
 			evt:        event,
 			err:        err,
-			diff:       diff,
+			diff:       result.diff,
 			urn:        urn,
 			old:        old,
 			new:        new,

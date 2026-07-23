@@ -278,21 +278,50 @@ func (ex *deploymentExecutor) Execute(callerCtx context.Context) (_ *Plan, err e
 		// generator is done when its async counter is 0, i.e. for each async event it said it was going to do we've
 		// seen and posted that event back to it.
 		seenNil := false
+		var pendingMigrationEvent RegisterResourceEvent
+		migrationFence := false
+
+		handleEvent := func(event SourceEvent) error {
+			if err := ex.handleSingleEvent(ctx, event); err != nil {
+				if !result.IsBail(err) {
+					logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", err)
+					ex.reportError(ex.deployment.generateEventURN(event), err)
+				}
+				cancel()
+				return result.BailError(err)
+			}
+			return nil
+		}
+
 		for {
+			// A state migration rewrites the base state used by every subsequent planning decision. Before applying one,
+			// consume every continuation promised by earlier planner work. Once those continuations have been planned,
+			// applyStateMigrations' step-executor write lock waits for their complete execution chains to finish.
+			if pendingMigrationEvent != nil && ex.asyncEventsExpected == 0 {
+				event := pendingMigrationEvent
+				pendingMigrationEvent = nil
+				if err := handleEvent(event); err != nil {
+					return false, err
+				}
+			}
+			if migrationFence && pendingMigrationEvent == nil && ex.asyncEventsExpected == 0 {
+				migrationFence = false
+			}
+
+			var sourceEvents <-chan nextEvent
+			if !migrationFence {
+				sourceEvents = incomingEvents
+			}
+
 			select {
 			case event := <-stepGenEvents:
 				logging.V(4).Infof("deploymentExecutor.Execute(...): incoming async event")
 
-				if err := ex.handleSingleEvent(ctx, event); err != nil {
-					if !result.IsBail(err) {
-						logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", err)
-						ex.reportError(ex.deployment.generateEventURN(event), err)
-					}
-					cancel()
-					return false, result.BailError(err)
+				if err := handleEvent(event); err != nil {
+					return false, err
 				}
 
-			case event := <-incomingEvents:
+			case event := <-sourceEvents:
 				logging.V(4).Infof("deploymentExecutor.Execute(...): incoming source event (nil? %v, %v)", event.Event == nil,
 					event.Error)
 
@@ -309,13 +338,18 @@ func (ex *deploymentExecutor) Execute(callerCtx context.Context) (_ *Plan, err e
 				if event.Event == nil {
 					seenNil = true
 				} else {
-					if err := ex.handleSingleEvent(ctx, event.Event); err != nil {
-						if !result.IsBail(err) {
-							logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", err)
-							ex.reportError(ex.deployment.generateEventURN(event.Event), err)
+					registration, hasMigration := event.Event.(RegisterResourceEvent)
+					hasMigration = hasMigration && len(registration.StateMigrations()) != 0
+					if hasMigration {
+						migrationFence = true
+						if ex.asyncEventsExpected != 0 {
+							pendingMigrationEvent = registration
+							continue
 						}
-						cancel()
-						return false, result.BailError(err)
+					}
+
+					if err := handleEvent(event.Event); err != nil {
+						return false, err
 					}
 				}
 			case <-ctx.Done():

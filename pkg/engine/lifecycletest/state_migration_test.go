@@ -1069,6 +1069,77 @@ func TestStateMigrationSkippedDuringDestroy(t *testing.T) {
 	assert.Empty(t, snap.Resources)
 }
 
+// TestStateMigrationAliasClaimsSuccessor verifies that a program alias naming a migration predecessor is resolved
+// to the committed successor. This supports hoisting a migrated child out of its component later in the same update.
+func TestStateMigrationAliasClaimsSuccessor(t *testing.T) {
+	t.Parallel()
+
+	const hoistedURN = resource.URN("urn:pulumi:test::test::pkgA:m:typA::hoisted")
+	loaders := []*deploytest.ProviderLoader{
+		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
+			return &deploytest.Provider{}, nil
+		}),
+	}
+
+	upgrade := false
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		callbacks, err := deploytest.NewCallbacksServer()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, callbacks.Close()) }()
+
+		if upgrade {
+			callback := renameMigration(t, callbacks, "childA", "childB")
+			_, err = monitor.RegisterResource("my:module:Comp", "comp", false, deploytest.ResourceOptions{
+				StateMigrations: []*pulumirpc.Callback{callback},
+			})
+			if err != nil {
+				return err
+			}
+
+			_, err = monitor.RegisterResource("pkgA:m:typA", "hoisted", true, deploytest.ResourceOptions{
+				Inputs:    resource.PropertyMap{"foo": resource.NewProperty("bar")},
+				AliasURNs: []resource.URN{childAURN},
+			})
+			return err
+		}
+
+		component, err := monitor.RegisterResource("my:module:Comp", "comp", false, deploytest.ResourceOptions{})
+		if err != nil {
+			return err
+		}
+		_, err = monitor.RegisterResource("pkgA:m:typA", "childA", true, deploytest.ResourceOptions{
+			Parent: component.URN,
+			Inputs: resource.PropertyMap{"foo": resource.NewProperty("bar")},
+		})
+		return err
+	})
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
+	plan := &lt.TestPlan{Options: lt.TestUpdateOptions{T: t, HostF: hostF, SkipDisplayTests: true}}
+
+	snap, err := runUpdate(t, plan, nil, nil)
+	require.NoError(t, err)
+	var childID resource.ID
+	for _, state := range snap.Resources {
+		if state.URN == childAURN {
+			childID = state.ID
+		}
+	}
+	require.NotEmpty(t, childID)
+
+	upgrade = true
+	snap, err = runUpdate(t, plan, snap, validateOps(t, map[display.StepOp]int{deploy.OpSame: 3}))
+	require.NoError(t, err)
+	assert.NotContains(t, snapURNs(snap), childAURN)
+	assert.NotContains(t, snapURNs(snap), childBURN)
+	require.Contains(t, snapURNs(snap), hoistedURN)
+	for _, state := range snap.Resources {
+		if state.URN == hoistedURN {
+			assert.Equal(t, childID, state.ID)
+			assert.Empty(t, state.Parent)
+		}
+	}
+}
+
 // TestStateMigrationRejectsClaimedState tests that a migration cannot rewrite prior state that an earlier
 // registration in the same deployment already claimed via an alias (a resource hoisted out of the component).
 func TestStateMigrationRejectsClaimedState(t *testing.T) {
@@ -1454,9 +1525,10 @@ const (
 type nestedEnv struct {
 	plan *lt.TestPlan
 
-	nestedName string
-	leafName   string
-	migrations func(t *testing.T, callbacks *deploytest.CallbackServer) []*pulumirpc.Callback
+	nestedName       string
+	leafName         string
+	migrations       func(t *testing.T, callbacks *deploytest.CallbackServer) []*pulumirpc.Callback
+	nestedMigrations func(t *testing.T, callbacks *deploytest.CallbackServer) []*pulumirpc.Callback
 }
 
 func newNestedEnv(t *testing.T) *nestedEnv {
@@ -1477,6 +1549,10 @@ func newNestedEnv(t *testing.T) *nestedEnv {
 		if env.migrations != nil {
 			migrations = env.migrations(t, callbacks)
 		}
+		var nestedMigrations []*pulumirpc.Callback
+		if env.nestedMigrations != nil {
+			nestedMigrations = env.nestedMigrations(t, callbacks)
+		}
 
 		comp, err := monitor.RegisterResource("my:module:Comp", "comp", false, deploytest.ResourceOptions{
 			StateMigrations: migrations,
@@ -1485,7 +1561,8 @@ func newNestedEnv(t *testing.T) *nestedEnv {
 			return err
 		}
 		nested, err := monitor.RegisterResource("my:module:Nested", env.nestedName, false, deploytest.ResourceOptions{
-			Parent: comp.URN,
+			Parent:          comp.URN,
+			StateMigrations: nestedMigrations,
 		})
 		if err != nil {
 			return err
@@ -1503,8 +1580,8 @@ func newNestedEnv(t *testing.T) *nestedEnv {
 }
 
 // TestStateMigrationNestedComponents tests migrations over a subtree deeper than one level: a component
-// containing a nested component containing a custom leaf. The migration renames both the nested component and
-// the leaf, exercising the transitive subtree collection and the multi-hop parent-chain validation.
+// containing a nested component containing a custom leaf. It covers both one migration over the complete subtree
+// and distinct migrations applied from the outer component to the inner component.
 func TestStateMigrationNestedComponents(t *testing.T) {
 	t.Parallel()
 
@@ -1572,23 +1649,32 @@ func TestStateMigrationNestedComponents(t *testing.T) {
 		}
 	})
 
-	t.Run("rewrites a child's parent to its successor", func(t *testing.T) {
+	t.Run("orders outer and nested migrations", func(t *testing.T) {
 		t.Parallel()
 
 		env := newNestedEnv(t)
 
 		snap, err := runUpdate(t, env.plan, nil, nil)
 		require.NoError(t, err)
-		// The migration renames the intermediate component and deliberately leaves the leaf parented to the old
-		// URN. The engine rewrites that reference from the explicit successor mapping.
+
+		// The outer migration renames only the intermediate component. The engine rewrites the leaf's parent from
+		// that successor mapping before invoking the migration registered by the nested component.
 		env.nestedName = "nestedB"
+		env.leafName = "leafB"
 		env.migrations = func(t *testing.T, callbacks *deploytest.CallbackServer) []*pulumirpc.Callback {
+			return []*pulumirpc.Callback{renameMigration(t, callbacks, "nestedA", "nestedB")}
+		}
+		env.nestedMigrations = func(t *testing.T, callbacks *deploytest.CallbackServer) []*pulumirpc.Callback {
 			callback, err := callbacks.Allocate(
 				StateMigrationFunction(func(
 					urn resource.URN, resources []apitype.ResourceV3,
 				) ([]apitype.ResourceV3, map[resource.URN]resource.URN, error) {
-					return renameByName(resources, "nestedA", "nestedB"),
-						map[resource.URN]resource.URN{nestedAURN: nestedBURN}, nil
+					assert.Equal(t, nestedBURN, urn)
+					require.Len(t, resources, 2)
+					assert.Equal(t, nestedBURN, resources[0].URN)
+					assert.Equal(t, nestedBURN, resources[1].Parent)
+					return renameByName(resources, "leafA", "leafB"),
+						map[resource.URN]resource.URN{leafAURN: leafBURN}, nil
 				}))
 			require.NoError(t, err)
 			return []*pulumirpc.Callback{callback}
@@ -1597,8 +1683,13 @@ func TestStateMigrationNestedComponents(t *testing.T) {
 		snap, err = runUpdate(t, env.plan, snap,
 			validateOps(t, map[display.StepOp]int{deploy.OpSame: 4}))
 		require.NoError(t, err)
+		urns := snapURNs(snap)
+		assert.Contains(t, urns, nestedBURN)
+		assert.Contains(t, urns, leafBURN)
+		assert.NotContains(t, urns, nestedAURN)
+		assert.NotContains(t, urns, leafAURN)
 		for _, state := range snap.Resources {
-			if state.URN == leafAURN {
+			if state.URN == leafBURN {
 				assert.Equal(t, nestedBURN, state.Parent)
 			}
 		}

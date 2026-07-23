@@ -99,7 +99,8 @@ func (sg *stepGenerator) applyStateMigrations(
 	olds := sg.deployment.Olds()
 	root, hasOld := olds[urn]
 	if !hasOld {
-		for _, alias := range sg.generateAliases(goal.Name, goal.Type, goal.Parent, goal.Aliases) {
+		aliases := sg.generateCanonicalAliases(goal.Name, goal.Type, goal.Parent, goal.Aliases)
+		for _, alias := range aliases {
 			if root, hasOld = olds[alias]; hasOld {
 				break
 			}

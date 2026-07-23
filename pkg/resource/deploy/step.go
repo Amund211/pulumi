@@ -2442,16 +2442,21 @@ func getProvider(s Step, override plugin.Provider) (plugin.Provider, error) {
 
 // DiffStep isn't really a step like a normal step. It's just a way to get access to the parallel but bounded step
 // workers. We use this step to call `provider.Diff` in parallel with other steps.
+type diffStepResult struct {
+	diff plugin.DiffResult
+	err  error
+}
+
 type DiffStep struct {
-	deployment    *Deployment                                  // the deployment that produced this diff
-	pcs           *promise.CompletionSource[plugin.DiffResult] // the completion source for this diff
-	old           *pkgresource.State                           // the old resource state
-	new           *pkgresource.State                           // the new resource state
-	ignoreChanges []string                                     // a list of property paths to ignore when diffing
+	deployment    *Deployment                               // the deployment that produced this diff
+	pcs           *promise.CompletionSource[diffStepResult] // the completion source for this diff
+	old           *pkgresource.State                        // the old resource state
+	new           *pkgresource.State                        // the new resource state
+	ignoreChanges []string                                  // a list of property paths to ignore when diffing
 }
 
 func NewDiffStep(
-	deployment *Deployment, pcs *promise.CompletionSource[plugin.DiffResult], old, new *pkgresource.State,
+	deployment *Deployment, pcs *promise.CompletionSource[diffStepResult], old, new *pkgresource.State,
 	ignoreChanges []string,
 ) Step {
 	return &DiffStep{
@@ -2480,12 +2485,12 @@ func (s *DiffStep) IsUntargeted() bool      { return false }
 func (s *DiffStep) Apply() (resource.Status, StepCompleteFunc, error) {
 	// DiffStep is a special step in that we're just using it as a way to get access to the parallel step
 	// workers. We don't actually want it to participate in the rest of what normally happens for step
-	// execution. As such we never actually return an error here, we just reject the completion source in an
-	// error case instead. The step generator will pick that error up and turn it into a stepgen error.
+	// execution. As such we never actually return an error here; the completion result carries it back to the step
+	// generator.
 
 	prov, err := getProvider(s, nil)
 	if err != nil {
-		s.pcs.Reject(err)
+		s.pcs.Fulfill(diffStepResult{err: err})
 		return resource.StatusOK, nil, nil
 	}
 
@@ -2493,21 +2498,17 @@ func (s *DiffStep) Apply() (resource.Status, StepCompleteFunc, error) {
 		s.deployment.Diag(),
 		s.new.URN, s.old.ID, s.old.Inputs, s.old.Outputs, s.new.Inputs, prov, s.deployment.opts.DryRun, s.ignoreChanges,
 	)
-	if err != nil {
-		s.pcs.Reject(err)
-		return resource.StatusOK, nil, nil
-	}
-	s.pcs.Fulfill(diff)
+	s.pcs.Fulfill(diffStepResult{diff: diff, err: err})
 
 	return resource.StatusOK, nil, nil
 }
 
 func (s *DiffStep) Fail() {
-	s.pcs.Reject(errors.New("failed diff resource"))
+	s.pcs.Fulfill(diffStepResult{err: errors.New("failed diff resource")})
 }
 
 func (s *DiffStep) Skip() {
-	s.pcs.Reject(errors.New("skipped diff resource"))
+	s.pcs.Fulfill(diffStepResult{err: errors.New("skipped diff resource")})
 }
 
 // ViewStep isn't like a normal step. It's a virtual step for a view resource. The step itself
