@@ -22,7 +22,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 )
 
-var _ = SnapshotManager((*CombinedManager)(nil))
+var _ SnapshotManager = (*CombinedManager)(nil)
 
 // CombinedManager combines multiple SnapshotManagers into one, it simply forwards on each call to every manager.
 type CombinedManager struct {
@@ -58,6 +58,46 @@ func (c *CombinedManager) RebuiltBaseState() error {
 	for i, m := range c.Managers {
 		if err := m.RebuiltBaseState(); err != nil {
 			if len(c.CollectErrorsOnly) > i && c.CollectErrorsOnly[i] {
+				c.appendError(err)
+			} else {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c *CombinedManager) SupportsStateMigrations() bool {
+	hasRequiredManager := false
+	for i, manager := range c.Managers {
+		if len(c.CollectErrorsOnly) > i && c.CollectErrorsOnly[i] {
+			continue
+		}
+
+		hasRequiredManager = true
+		if !manager.SupportsStateMigrations() {
+			return false
+		}
+	}
+	return hasRequiredManager
+}
+
+func (c *CombinedManager) StateMigration(plan *deploy.StateMigrationPlan) error {
+	if !c.SupportsStateMigrations() {
+		return deploy.ErrStateMigrationsUnsupported
+	}
+
+	// As with the other CombinedManager mutations, forwarding is sequential rather than a distributed transaction.
+	// Production configurations use one authoritative manager; additional validation/shadow managers are best-effort.
+	var errs []error
+	for i, manager := range c.Managers {
+		bestEffort := len(c.CollectErrorsOnly) > i && c.CollectErrorsOnly[i]
+		// The preflight above guarantees every authoritative manager supports migrations.
+		if bestEffort && !manager.SupportsStateMigrations() {
+			continue
+		}
+		if err := manager.StateMigration(plan); err != nil {
+			if bestEffort {
 				c.appendError(err)
 			} else {
 				errs = append(errs, err)

@@ -33,6 +33,13 @@ type SnapshotManager interface {
 	// the base state after a refresh
 	RebuiltBaseState() error
 
+	// SupportsStateMigrations reports whether this manager can persist state migrations.
+	SupportsStateMigrations() bool
+
+	// StateMigration is called with the validated, fully rewritten migration plan just before the engine mutates
+	// its base snapshot. An error aborts the migration before any state is changed.
+	StateMigration(plan *deploy.StateMigrationPlan) error
+
 	// SetSnippets replaces the PCL snippets that should be persisted with the next snapshot.
 	SetSnippets(snippets []resource.Snippet) error
 
