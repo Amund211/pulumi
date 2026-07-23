@@ -17,6 +17,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -91,8 +92,58 @@ func SerializeJournalEntry(
 		}
 	}
 
+	var migratedStates []apitype.ResourceV3
+	if je.MigratedStates != nil {
+		migratedStates = make([]apitype.ResourceV3, len(je.MigratedStates))
+		for i, migrated := range je.MigratedStates {
+			s, encodedByteString, err := stack.SerializeResource(ctx, migrated, enc, false)
+			if err != nil {
+				return apitype.JournalEntry{}, fmt.Errorf("serializing migrated resource state: %w", err)
+			}
+			migratedStates[i] = s
+			requiresByteString = requiresByteString || encodedByteString
+		}
+	}
+	var baseStatePatches []apitype.JournalBaseStatePatch
+	if je.BaseStatePatches != nil {
+		baseStatePatches = make([]apitype.JournalBaseStatePatch, len(je.BaseStatePatches))
+		for i, patch := range je.BaseStatePatches {
+			state, encodedByteString, err := stack.SerializeResource(ctx, patch.State, enc, false)
+			if err != nil {
+				return apitype.JournalEntry{}, fmt.Errorf("serializing migrated base resource state: %w", err)
+			}
+			baseStatePatches[i] = apitype.JournalBaseStatePatch{
+				Index: patch.Index,
+				State: state,
+			}
+			requiresByteString = requiresByteString || encodedByteString
+		}
+	}
+	var newStatePatches []apitype.JournalNewStatePatch
+	if je.NewStatePatches != nil {
+		newStatePatches = make([]apitype.JournalNewStatePatch, len(je.NewStatePatches))
+		for i, patch := range je.NewStatePatches {
+			state, encodedByteString, err := stack.SerializeResource(ctx, patch.State, enc, false)
+			if err != nil {
+				return apitype.JournalEntry{}, fmt.Errorf("serializing migrated operation resource state: %w", err)
+			}
+			newStatePatches[i] = apitype.JournalNewStatePatch{
+				OperationID: patch.OperationID,
+				State:       state,
+			}
+			requiresByteString = requiresByteString || encodedByteString
+		}
+	}
+	// State-migration entries carry exact resource patches and removal/insertion indices whose replay semantics only
+	// exist in journal format version 2, so stamp them accordingly. Replay applies the prepared patches and does not
+	// repeat migration or successor-resolution semantics.
+	entryVersion := 1
+	if je.Kind == engine.JournalEntryStateMigration {
+		entryVersion = 2
+	}
+
 	serializedEntry := apitype.JournalEntry{
-		Version:               1,
+		Version:               entryVersion,
 		Kind:                  apitype.JournalEntryKind(je.Kind),
 		SequenceID:            je.SequenceID,
 		OperationID:           je.OperationID,
@@ -110,8 +161,11 @@ func SerializeJournalEntry(
 		ExtensionRef:          je.ExtensionRef,
 		Extension:             je.Extension,
 		Snippets:              snippets,
-
-		RequiresByteString: requiresByteString,
+		RequiresByteString:    requiresByteString,
+		RemoveOlds:            je.RemoveOlds,
+		States:                migratedStates,
+		BaseStatePatches:      baseStatePatches,
+		NewStatePatches:       newStatePatches,
 	}
 
 	return serializedEntry, nil
@@ -143,7 +197,6 @@ type JournalReplayer struct {
 	// non-UTF8 bytes. It is tracked here because such strings inside secrets cannot be detected from
 	// the serialized resources this replayer holds.
 	requiresByteString bool
-
 	// index is the current index in the new resource list.
 	index int64
 
@@ -175,10 +228,15 @@ func NewJournalReplayer(base *apitype.DeploymentV3) *JournalReplayer {
 }
 
 func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
-	if entry.Version != 1 {
+	if entry.Version <= 0 || int64(entry.Version) > apitype.LatestJournalVersion {
 		return fmt.Errorf("unsupported journal entry version %d", entry.Version)
 	}
-	if entry.RequiresByteString {
+	if entry.Kind == apitype.JournalEntryKindStateMigration && entry.Version != 2 {
+		return fmt.Errorf("state migration journal entry must use version 2, got %d", entry.Version)
+	}
+	// A state-migration entry is validated transactionally below. Delay this bookkeeping bit as well so a rejected
+	// migration cannot affect a later deployment generated from the replayer.
+	if entry.RequiresByteString && entry.Kind != apitype.JournalEntryKindStateMigration {
 		r.requiresByteString = true
 	}
 	switch entry.Kind {
@@ -298,6 +356,13 @@ func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
 		r.extensions = make(map[apitype.ExtensionRef]apitype.Extension)
 	case apitype.JournalEntryKindExtensionParameterize:
 		r.extensions[*entry.ExtensionRef] = *entry.Extension
+	case apitype.JournalEntryKindStateMigration:
+		if err := r.applyStateMigration(entry); err != nil {
+			return err
+		}
+		if entry.RequiresByteString {
+			r.requiresByteString = true
+		}
 	default:
 		return fmt.Errorf("unsupported journal entry kind %d", entry.Kind)
 	}
@@ -320,6 +385,305 @@ func (r *JournalReplayer) newResourceForOperation(
 		return 0, nil, fmt.Errorf("journal %s operation %d resolves to a nil resource state", field, operationID)
 	}
 	return index, state, nil
+}
+
+// currentBaseResource materializes the state of a base resource after applying journal entries that update it
+// without replacing the base snapshot itself. This is the state observed by the live engine at the same point.
+func (r *JournalReplayer) currentBaseResource(index int64) apitype.ResourceV3 {
+	state := r.base.Resources[index]
+	if replacement, ok := r.toReplaceInSnapshot[index]; ok {
+		state = *replacement
+	}
+	if _, ok := r.markAsDeletion[index]; ok {
+		state.Delete = true
+	}
+	if _, ok := r.markAsPendingReplacement[index]; ok {
+		state.PendingReplacement = true
+	}
+	return state
+}
+
+// stateMigrationNonReferenceState returns the canonical serialized form of every field that reference rewriting is
+// not allowed to change. New ResourceV3 fields are included by default, so they fail closed until deliberately added
+// to the reference-bearing allow-list below.
+func stateMigrationNonReferenceState(state apitype.ResourceV3) ([]byte, error) {
+	state.Inputs = nil
+	state.Outputs = nil
+	state.Parent = ""
+	state.Dependencies = nil
+	state.Provider = ""
+	state.PropertyDependencies = nil
+	state.DeletedWith = ""
+	state.ReplaceWith = nil
+	state.ReplacementTrigger = nil
+	state.ViewOf = ""
+
+	// Typed state canonicalizes an empty timeout block to nil. Times may also carry equivalent locations or monotonic
+	// clock readings. Normalize both representations before comparing serialized checkpoint state.
+	if state.CustomTimeouts != nil && !state.CustomTimeouts.IsNotEmpty() {
+		state.CustomTimeouts = nil
+	}
+	normalizeTime := func(value *time.Time) *time.Time {
+		if value == nil {
+			return nil
+		}
+		normalized := value.Round(0).UTC()
+		return &normalized
+	}
+	state.Created = normalizeTime(state.Created)
+	state.Modified = normalizeTime(state.Modified)
+
+	// At the checkpoint boundary nil and empty collections are equivalent. JSON omitempty canonicalizes top-level
+	// collections; normalize empty hook-name lists nested inside the non-empty hooks map as well.
+	if len(state.ResourceHooks) == 0 {
+		state.ResourceHooks = nil
+	} else {
+		hooks := make(map[resource.HookType][]string, len(state.ResourceHooks))
+		for hook, names := range state.ResourceHooks {
+			if len(names) == 0 {
+				names = nil
+			}
+			hooks[hook] = names
+		}
+		state.ResourceHooks = hooks
+	}
+
+	return json.Marshal(state)
+}
+
+func validateStateMigrationPatch(original, patched apitype.ResourceV3) error {
+	originalState, err := stateMigrationNonReferenceState(original)
+	if err != nil {
+		return fmt.Errorf("serializing original non-reference resource state: %w", err)
+	}
+	patchedState, err := stateMigrationNonReferenceState(patched)
+	if err != nil {
+		return fmt.Errorf("serializing patched non-reference resource state: %w", err)
+	}
+	if !bytes.Equal(originalState, patchedState) {
+		return errors.New("changes non-reference resource state")
+	}
+	return nil
+}
+
+func validateProspectiveStateMigration(prospective *apitype.DeploymentV3) error {
+	resources := prospective.Resources
+	referenceable := make(map[resource.URN]struct{}, len(resources))
+	for i, state := range resources {
+		if !state.URN.IsValid() {
+			return fmt.Errorf("resource at index %d has invalid URN %q", i, state.URN)
+		}
+		if state.Type != state.URN.Type() {
+			return fmt.Errorf("resource %s has type %s, which does not match its URN type", state.URN, state.Type)
+		}
+		if !state.Delete {
+			referenceable[state.URN] = struct{}{}
+		}
+		if state.ExtensionRef != "" {
+			if _, ok := prospective.Extensions[state.ExtensionRef]; !ok {
+				return fmt.Errorf("resource %s references unknown extension %s", state.URN, state.ExtensionRef)
+			}
+		}
+	}
+	for _, state := range resources {
+		if state.ViewOf != "" {
+			if _, ok := referenceable[state.ViewOf]; !ok {
+				return fmt.Errorf("view resource %s refers to missing resource %s", state.URN, state.ViewOf)
+			}
+		}
+		for _, urn := range state.ReplaceWith {
+			if _, ok := referenceable[urn]; !ok {
+				return fmt.Errorf("resource %s has missing replace-with resource %s", state.URN, urn)
+			}
+		}
+	}
+
+	return snapshot.VerifyIntegrity(prospective)
+}
+
+// applyStateMigration applies a prepared state-migration transaction. Every reference-bearing state that changed was
+// rewritten while it was still typed and decrypted, then serialized into this entry. Replay only installs those exact
+// states; it does not reinterpret successor mappings.
+func (r *JournalReplayer) applyStateMigration(entry apitype.JournalEntry) error {
+	if r.base == nil {
+		return errors.New("state migration journal entry has no base snapshot")
+	}
+	if len(r.base.PendingOperations) != 0 {
+		return errors.New("state migration journal entry cannot be applied with pending base operations")
+	}
+	for operationID, incomplete := range r.incompleteOps {
+		// Cloud can persist an elided Same as a Begin without an Operation. It does not represent an in-flight
+		// provider operation and is safe to carry across the migration. A Begin with an Operation would leave its
+		// embedded resource state outside the prepared patch transaction, so reject it.
+		if incomplete.Operation != nil {
+			return fmt.Errorf(
+				"state migration journal entry cannot be applied with incomplete operation %d", operationID)
+		}
+	}
+	if len(entry.RemoveOlds) == 0 {
+		return errors.New("state migration journal entry removes no resources")
+	}
+	if len(entry.States) == 0 {
+		return errors.New("state migration journal entry inserts no resources")
+	}
+
+	removed := make(map[int64]struct{}, len(entry.RemoveOlds))
+	var previous int64 = -1
+	for _, index := range entry.RemoveOlds {
+		if index < 0 || index >= int64(len(r.base.Resources)) {
+			return fmt.Errorf("state migration remove index %d is outside base snapshot with %d resources",
+				index, len(r.base.Resources))
+		}
+		if index <= previous {
+			return fmt.Errorf("state migration remove indices must be strictly increasing: %v", entry.RemoveOlds)
+		}
+		previous = index
+		removed[index] = struct{}{}
+	}
+
+	// Stage every mutation until the exact deployment assembled from it passes integrity validation. The migration
+	// replaces entries in newResources but does not mutate the pointed-to states, so cloning the slice is sufficient;
+	// all affected index maps and the base deployment are rebuilt below before assignment.
+	staged := *r
+	staged.newResources = slices.Clone(r.newResources)
+
+	baseResources := slices.Clone(r.base.Resources)
+	patchedBase := make(map[int64]struct{}, len(entry.BaseStatePatches))
+	for _, patch := range entry.BaseStatePatches {
+		if patch.Index < 0 || patch.Index >= int64(len(baseResources)) {
+			return fmt.Errorf("state migration base patch index %d is outside base snapshot with %d resources",
+				patch.Index, len(baseResources))
+		}
+		if _, removed := removed[patch.Index]; removed {
+			return fmt.Errorf("state migration base patch index %d is also removed", patch.Index)
+		}
+		if _, duplicate := patchedBase[patch.Index]; duplicate {
+			return fmt.Errorf("state migration contains duplicate base patch index %d", patch.Index)
+		}
+		current := r.currentBaseResource(patch.Index)
+		if err := validateStateMigrationPatch(current, patch.State); err != nil {
+			return fmt.Errorf("state migration base patch at index %d %w", patch.Index, err)
+		}
+		patchedBase[patch.Index] = struct{}{}
+		baseResources[patch.Index] = patch.State
+	}
+
+	patchedNew := make(map[int64]struct{}, len(entry.NewStatePatches))
+	for _, patch := range entry.NewStatePatches {
+		if _, removed := r.toRemove[patch.OperationID]; removed {
+			return fmt.Errorf("state migration new-state patch references removed operation %d", patch.OperationID)
+		}
+		index, ok := r.operationIDToResourceIndex[patch.OperationID]
+		if !ok {
+			return fmt.Errorf("state migration new-state patch references unknown operation %d", patch.OperationID)
+		}
+		if index < 0 || index >= int64(len(r.newResources)) {
+			return fmt.Errorf("state migration new-state patch for operation %d resolves to invalid index %d",
+				patch.OperationID, index)
+		}
+		if _, duplicate := patchedNew[patch.OperationID]; duplicate {
+			return fmt.Errorf("state migration contains duplicate new-state patch for operation %d", patch.OperationID)
+		}
+		current := r.newResources[index]
+		if current == nil {
+			return fmt.Errorf("state migration new-state patch for operation %d resolves to a nil state", patch.OperationID)
+		}
+		if err := validateStateMigrationPatch(*current, patch.State); err != nil {
+			return fmt.Errorf("state migration new-state patch for operation %d %w", patch.OperationID, err)
+		}
+		patchedNew[patch.OperationID] = struct{}{}
+		state := patch.State
+		staged.newResources[index] = &state
+	}
+
+	insertedURNs := make(map[resource.URN]apitype.ResourceV3, len(entry.States))
+	for i, state := range entry.States {
+		if !state.URN.IsValid() {
+			return fmt.Errorf("state migration inserted state %d has invalid URN %q", i, state.URN)
+		}
+		if state.Type != state.URN.Type() {
+			return fmt.Errorf("state migration inserted state %s has type %s", state.URN, state.Type)
+		}
+		if state.Delete {
+			return fmt.Errorf("state migration inserted state %s is marked for deletion", state.URN)
+		}
+		if state.ViewOf != "" {
+			return fmt.Errorf("state migration inserted state %s is a view of %s", state.URN, state.ViewOf)
+		}
+		if state.Custom && state.ID == "" {
+			return fmt.Errorf("state migration inserted custom state %s has no physical ID", state.URN)
+		}
+		if state.ExtensionRef != "" {
+			_, inBase := r.base.Extensions[state.ExtensionRef]
+			_, inJournal := r.extensions[state.ExtensionRef]
+			if !inBase && !inJournal {
+				return fmt.Errorf("state migration inserted state %s references unknown extension %s",
+					state.URN, state.ExtensionRef)
+			}
+		}
+		if _, duplicate := insertedURNs[state.URN]; duplicate {
+			return fmt.Errorf("state migration inserts duplicate resource %s", state.URN)
+		}
+		insertedURNs[state.URN] = state
+	}
+
+	last := entry.RemoveOlds[len(entry.RemoveOlds)-1]
+	newIndices := make(map[int64]int64, len(baseResources))
+	resources := make([]apitype.ResourceV3, 0, len(baseResources)-len(entry.RemoveOlds)+len(entry.States))
+	for i, res := range baseResources {
+		if _, ok := removed[int64(i)]; ok {
+			if int64(i) == last {
+				resources = append(resources, entry.States...)
+			}
+			continue
+		}
+		newIndices[int64(i)] = int64(len(resources))
+		resources = append(resources, res)
+	}
+
+	// The base snapshot object may be shared with the journaler, which replays all entries from scratch on
+	// every save: rebase onto a copy rather than mutating it in place, mirroring what Write entries do.
+	newBase := *r.base
+	newBase.Resources = resources
+	staged.base = &newBase
+
+	remapSet := func(set map[int64]struct{}) map[int64]struct{} {
+		remapped := make(map[int64]struct{}, len(set))
+		for index := range set {
+			if newIndex, ok := newIndices[index]; ok {
+				remapped[newIndex] = struct{}{}
+			}
+		}
+		return remapped
+	}
+	staged.toDeleteInSnapshot = remapSet(r.toDeleteInSnapshot)
+	staged.markAsDeletion = remapSet(r.markAsDeletion)
+	staged.markAsPendingReplacement = remapSet(r.markAsPendingReplacement)
+
+	toReplace := make(map[int64]*apitype.ResourceV3, len(r.toReplaceInSnapshot))
+	for index, state := range r.toReplaceInSnapshot {
+		// The prepared base patch is the exact state after applying both the earlier
+		// operation and this migration. Do not let the earlier refresh/outputs
+		// overlay replace it when the deployment is assembled.
+		if _, patched := patchedBase[index]; patched {
+			continue
+		}
+		if newIndex, ok := newIndices[index]; ok {
+			toReplace[newIndex] = state
+		}
+	}
+	staged.toReplaceInSnapshot = toReplace
+
+	prospective, err := staged.generateDeployment()
+	if err != nil {
+		return fmt.Errorf("assembling prospective state migration snapshot: %w", err)
+	}
+	if err := validateProspectiveStateMigration(prospective.Deployment); err != nil {
+		return fmt.Errorf("state migration produces invalid snapshot: %w", err)
+	}
+
+	*r = staged
+	return nil
 }
 
 // rebuildDependencies rebuilds the dependencies of the resources in the snapshot based on the
@@ -384,7 +748,9 @@ func undangleParentResources(undeleted map[resource.URN]bool, resources []apityp
 	}
 }
 
-func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) {
+// generateDeployment assembles the journal's current deployment without normalizing aliases. State-migration replay
+// uses this form to validate untrusted journal state before normalization assumes provider references are well-formed.
+func (r *JournalReplayer) generateDeployment() (apitype.TypedDeployment, error) {
 	features := make(map[string]bool)
 	removeIndices := make(map[int64]struct{})
 	for operationID := range r.toRemove {
@@ -398,6 +764,9 @@ func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) 
 	resources := make([]apitype.ResourceV3, 0)
 	for i, res := range r.newResources {
 		if _, ok := removeIndices[int64(i)]; !ok {
+			if res == nil {
+				return apitype.TypedDeployment{}, fmt.Errorf("journal new resource at index %d is nil", i)
+			}
 			resources = append(resources, *res)
 			stack.ApplyFeatures(*res, r.requiresByteString, features)
 		}
@@ -405,28 +774,11 @@ func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) 
 
 	// Append any resources from the base plan that were not produced by the current plan.
 	if r.base != nil {
-		for i, res := range r.base.Resources {
+		for i := range r.base.Resources {
 			if _, ok := r.toDeleteInSnapshot[int64(i)]; !ok {
-				if _, ok := r.markAsPendingReplacement[int64(i)]; ok {
-					res.PendingReplacement = true
-				}
-
-				if state, ok := r.toReplaceInSnapshot[int64(i)]; ok {
-					// If this is a resource that was replaced, we want to
-					// replace it in the snapshot.  We only do so if the same
-					// resource has not been marked for deletion.  This
-					// could happen, e.g. if a refresh happens first (so
-					// we're supposed to replace the resource), and then a
-					// delete happens (so we're supposed to delete the resource).
-					resources = append(resources, *state)
-					stack.ApplyFeatures(*state, r.requiresByteString, features)
-				} else {
-					if _, ok := r.markAsDeletion[int64(i)]; ok {
-						res.Delete = true
-					}
-					resources = append(resources, res)
-					stack.ApplyFeatures(res, r.requiresByteString, features)
-				}
+				state := r.currentBaseResource(int64(i))
+				resources = append(resources, state)
+				stack.ApplyFeatures(state, r.requiresByteString, features)
 			}
 		}
 	}
@@ -453,8 +805,8 @@ func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) 
 	}
 
 	if r.hasRefresh {
-		// Rebuild dependencies if we had a refresh, as refreshes may delete resources,
-		// which may cause other resources to have dangling dependencies.
+		// Refreshes can delete resources without exact typed patches for their dependents, so prune dangling
+		// dependencies. State migrations carry exact prepared patches and deliberately require mechanical replay.
 		rebuildDependencies(resources)
 	}
 
@@ -488,16 +840,23 @@ func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) 
 		version = apitype.DeploymentSchemaVersionLatest
 	}
 
-	deployment, err := deployment.NormalizeURNReferences()
-	if err != nil {
-		return apitype.TypedDeployment{}, fmt.Errorf("failed to normalize URN references: %w", err)
-	}
-
 	return apitype.TypedDeployment{
 		Deployment: deployment,
 		Version:    version,
 		Features:   slices.Sorted(maps.Keys(features)),
 	}, nil
+}
+
+func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) {
+	deployment, err := r.generateDeployment()
+	if err != nil {
+		return apitype.TypedDeployment{}, err
+	}
+	deployment.Deployment, err = deployment.Deployment.NormalizeURNReferences()
+	if err != nil {
+		return apitype.TypedDeployment{}, fmt.Errorf("failed to normalize URN references: %w", err)
+	}
+	return deployment, nil
 }
 
 // snap produces a new Snapshot given the base snapshot and a list of resources that the current
