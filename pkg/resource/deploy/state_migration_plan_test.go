@@ -41,6 +41,18 @@ func TestFinalStateMigrationSuccessors(t *testing.T) {
 		"urn:a": "urn:c",
 		"urn:b": "urn:c",
 	}, rewrite)
+
+	// Callback output sees the complete chain so references to a transient intermediate state cannot dangle.
+	migrated := &pkgresource.State{Dependencies: []resource.URN{"urn:b"}}
+	rewrittenMigrated, err := rewriteStateMigrationReferences([]*pkgresource.State{migrated}, rewrite)
+	require.NoError(t, err)
+	assert.Equal(t, []resource.URN{"urn:c"}, rewrittenMigrated[0].Dependencies)
+
+	// Outside the subtree, urn:b may identify an unrelated retained resource and must not be rewritten.
+	retained := &pkgresource.State{Dependencies: []resource.URN{"urn:b"}}
+	rewrittenRetained, err := rewriteStateMigrationReferences([]*pkgresource.State{retained}, canonical)
+	require.NoError(t, err)
+	assert.Same(t, retained, rewrittenRetained[0])
 }
 
 func TestFinalStateMigrationSuccessorsRejectsCycles(t *testing.T) {

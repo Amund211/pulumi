@@ -32,8 +32,8 @@ var ErrStateMigrationsUnsupported = errors.New("state migrations are not support
 // StateMigrationPlan is the validated, fully prepared transaction produced by a state migration.
 //
 // BaseResources contains the exact prepared resource values for the post-migration base. RetainedResources maps each
-// retained resource in the old base to its prepared value. SuccessorURNs maps each removed resource directly to a
-// resource in MigratedResources; it never contains chains. The engine commits equivalent values while preserving
+// rewritten retained resource in the old base to its prepared value. SuccessorURNs maps each removed resource directly
+// to a resource in MigratedResources; it never contains chains. The engine commits equivalent values while preserving
 // pointer identities.
 type StateMigrationPlan struct {
 	RootURN           resource.URN
