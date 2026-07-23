@@ -17,7 +17,11 @@ import pytest
 
 from pulumi.runtime import settings
 from pulumi.runtime.proto import resource_pb2
-from pulumi.runtime.settings import Settings, _load_monitor_feature_support
+from pulumi.runtime.settings import (
+    Settings,
+    _load_monitor_feature_support,
+    _sync_monitor_supports_state_migrations,
+)
 
 
 class _UnimplementedError(grpc.RpcError):
@@ -73,6 +77,7 @@ async def test_loads_features_from_get_deployment_info():
             resource_pb2.RESOURCE_MONITOR_FEATURE_RESOURCE_HOOKS,
             # Features with no legacy string ID never show up in feature_support.
             resource_pb2.RESOURCE_MONITOR_FEATURE_BYTE_STRING,
+            resource_pb2.RESOURCE_MONITOR_FEATURE_STATE_MIGRATIONS,
         ]
     )
     configure_monitor(monitor)
@@ -92,6 +97,7 @@ async def test_loads_features_from_get_deployment_info():
         "resourceHooks": True,
         "errorHooks": False,
     }
+    assert _sync_monitor_supports_state_migrations()
     assert monitor.supports_feature_calls == 0
 
 
@@ -128,3 +134,4 @@ async def test_falls_back_to_supports_feature_when_unimplemented():
         "secrets",
         "transforms",
     ]
+    assert not _sync_monitor_supports_state_migrations()

@@ -74,6 +74,7 @@ class Settings:
         self.dry_run = dry_run
         self.legacy_apply_enabled = legacy_apply_enabled
         self.feature_support = {}
+        self.monitor_features = set()
         self.organization = organization
         # Caches package references returned by `RegisterPackage` for
         # parameterized providers. Scoped to the deployment so concurrent inline
@@ -148,6 +149,9 @@ class Settings:
 
     @contextproperty
     def feature_support(self) -> Optional[dict]: ...
+
+    @contextproperty
+    def monitor_features(self) -> set[int]: ...  # type: ignore
 
     @contextproperty
     def package_refs(self) -> Optional[dict]: ...
@@ -394,6 +398,13 @@ def _sync_monitor_supports_parameterization() -> bool:
     return SETTINGS.feature_support.get("parameterization", False)
 
 
+def _sync_monitor_supports_state_migrations() -> bool:
+    return (
+        resource_pb2.RESOURCE_MONITOR_FEATURE_STATE_MIGRATIONS
+        in SETTINGS.monitor_features
+    )
+
+
 async def register_package(
     base_provider_name: str,
     base_provider_version: str,
@@ -542,10 +553,9 @@ async def _load_monitor_feature_support():
                 lambda: SETTINGS.monitor.GetDeploymentInfo(empty_pb2.Empty())
             ),
         )
+        SETTINGS.monitor_features = set(deployment_info.supportedFeatures)
         for feature, value in _LEGACY_FEATURE_MAPPING.items():
-            SETTINGS.feature_support[feature] = (
-                value in deployment_info.supportedFeatures
-            )
+            SETTINGS.feature_support[feature] = value in SETTINGS.monitor_features
 
     except grpc.RpcError as exn:
         if exn.code() != grpc.StatusCode.UNIMPLEMENTED:
@@ -556,3 +566,8 @@ async def _load_monitor_feature_support():
                 for feature in sorted(_LEGACY_FEATURE_MAPPING)
             )
         )
+        SETTINGS.monitor_features = {
+            value
+            for feature, value in _LEGACY_FEATURE_MAPPING.items()
+            if SETTINGS.feature_support.get(feature, False)
+        }
