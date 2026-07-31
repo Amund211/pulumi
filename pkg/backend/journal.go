@@ -175,6 +175,9 @@ func NewJournalReplayer(base *apitype.DeploymentV3) *JournalReplayer {
 }
 
 func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
+	if entry.Version != 1 {
+		return fmt.Errorf("unsupported journal entry version %d", entry.Version)
+	}
 	if entry.RequiresByteString {
 		r.requiresByteString = true
 	}
@@ -193,19 +196,30 @@ func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
 			r.toDeleteInSnapshot[*entry.RemoveOld] = struct{}{}
 		}
 		if entry.RemoveNew != nil {
+			if _, _, err := r.newResourceForOperation(*entry.RemoveNew, "remove-new"); err != nil {
+				return err
+			}
 			r.toRemove[*entry.RemoveNew] = struct{}{}
 		}
 		if entry.DeleteOld != nil {
 			r.markAsDeletion[*entry.DeleteOld] = struct{}{}
 		}
 		if entry.DeleteNew != nil {
-			r.newResources[r.operationIDToResourceIndex[*entry.DeleteNew]].Delete = true
+			_, state, err := r.newResourceForOperation(*entry.DeleteNew, "delete-new")
+			if err != nil {
+				return err
+			}
+			state.Delete = true
 		}
 		if entry.PendingReplacementOld != nil {
 			r.markAsPendingReplacement[*entry.PendingReplacementOld] = struct{}{}
 		}
 		if entry.PendingReplacementNew != nil {
-			r.newResources[r.operationIDToResourceIndex[*entry.PendingReplacementNew]].PendingReplacement = true
+			_, state, err := r.newResourceForOperation(*entry.PendingReplacementNew, "pending-replacement-new")
+			if err != nil {
+				return err
+			}
+			state.PendingReplacement = true
 		}
 
 		if entry.IsRefresh {
@@ -222,10 +236,14 @@ func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
 			}
 		}
 		if entry.RemoveNew != nil {
+			index, _, err := r.newResourceForOperation(*entry.RemoveNew, "refresh remove-new")
+			if err != nil {
+				return err
+			}
 			if entry.State == nil {
 				r.toRemove[*entry.RemoveNew] = struct{}{}
 			} else {
-				r.newResources[r.operationIDToResourceIndex[*entry.RemoveNew]] = entry.State
+				r.newResources[index] = entry.State
 			}
 		}
 	case apitype.JournalEntryKindFailure:
@@ -234,8 +252,14 @@ func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
 		if entry.State != nil && entry.RemoveOld != nil {
 			r.toReplaceInSnapshot[*entry.RemoveOld] = entry.State
 		}
-		if entry.State != nil && entry.RemoveNew != nil {
-			r.newResources[r.operationIDToResourceIndex[*entry.RemoveNew]] = entry.State
+		if entry.RemoveNew != nil {
+			index, _, err := r.newResourceForOperation(*entry.RemoveNew, "outputs remove-new")
+			if err != nil {
+				return err
+			}
+			if entry.State != nil {
+				r.newResources[index] = entry.State
+			}
 		}
 	case apitype.JournalEntryKindWrite:
 		// Overwrite the base snapshot. Note that we expect this to happen before any other
@@ -274,8 +298,28 @@ func (r *JournalReplayer) Add(entry apitype.JournalEntry) error {
 		r.extensions = make(map[apitype.ExtensionRef]apitype.Extension)
 	case apitype.JournalEntryKindExtensionParameterize:
 		r.extensions[*entry.ExtensionRef] = *entry.Extension
+	default:
+		return fmt.Errorf("unsupported journal entry kind %d", entry.Kind)
 	}
 	return nil
+}
+
+func (r *JournalReplayer) newResourceForOperation(
+	operationID int64, field string,
+) (int64, *apitype.ResourceV3, error) {
+	index, ok := r.operationIDToResourceIndex[operationID]
+	if !ok {
+		return 0, nil, fmt.Errorf("journal %s references unknown operation %d", field, operationID)
+	}
+	if index < 0 || index >= int64(len(r.newResources)) {
+		return 0, nil, fmt.Errorf(
+			"journal %s operation %d resolves to invalid resource index %d", field, operationID, index)
+	}
+	state := r.newResources[index]
+	if state == nil {
+		return 0, nil, fmt.Errorf("journal %s operation %d resolves to a nil resource state", field, operationID)
+	}
+	return index, state, nil
 }
 
 // rebuildDependencies rebuilds the dependencies of the resources in the snapshot based on the
@@ -343,8 +387,12 @@ func undangleParentResources(undeleted map[resource.URN]bool, resources []apityp
 func (r *JournalReplayer) GenerateDeployment() (apitype.TypedDeployment, error) {
 	features := make(map[string]bool)
 	removeIndices := make(map[int64]struct{})
-	for k := range r.toRemove {
-		removeIndices[r.operationIDToResourceIndex[k]] = struct{}{}
+	for operationID := range r.toRemove {
+		index, _, err := r.newResourceForOperation(operationID, "remove-new")
+		if err != nil {
+			return apitype.TypedDeployment{}, err
+		}
+		removeIndices[index] = struct{}{}
 	}
 
 	resources := make([]apitype.ResourceV3, 0)

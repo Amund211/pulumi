@@ -15,6 +15,7 @@
 package backend
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/pulumi/pulumi/pkg/v3/engine"
@@ -101,6 +102,7 @@ func TestJournalReplayerRefreshPrunesReplaceWith(t *testing.T) {
 	// old state in the base snapshot.
 	removeOld := int64(1)
 	require.NoError(t, replayer.Add(apitype.JournalEntry{
+		Version:     1,
 		Kind:        apitype.JournalEntryKindRefreshSuccess,
 		OperationID: 1,
 		RemoveOld:   &removeOld,
@@ -123,5 +125,71 @@ func TestJournalReplayerRefreshPrunesReplaceWith(t *testing.T) {
 	assert.Empty(t, byURN[unrelated.URN].ReplaceWith)
 	for _, r := range deployment.Deployment.Resources {
 		assert.NotContains(t, r.ReplaceWith, resource.URN(""), "resource %s", r.URN)
+	}
+}
+
+func TestJournalReplayerRejectsUnsupportedEntryVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, version := range []int{0, 2} {
+		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
+			t.Parallel()
+
+			err := NewJournalReplayer(&apitype.DeploymentV3{}).Add(apitype.JournalEntry{
+				Version: version,
+				Kind:    apitype.JournalEntryKindBegin,
+			})
+			require.ErrorContains(t, err, fmt.Sprintf("unsupported journal entry version %d", version))
+		})
+	}
+}
+
+func TestJournalReplayerRejectsUnknownEntryKind(t *testing.T) {
+	t.Parallel()
+
+	err := NewJournalReplayer(&apitype.DeploymentV3{}).Add(apitype.JournalEntry{
+		Version: 1,
+		Kind:    apitype.JournalEntryKind(999),
+	})
+	require.ErrorContains(t, err, "unsupported journal entry kind 999")
+}
+
+func TestJournalReplayerRejectsUnknownNewOperationReferences(t *testing.T) {
+	t.Parallel()
+
+	operationID := int64(42)
+	tests := map[string]apitype.JournalEntry{
+		"remove new": {
+			Version:   1,
+			Kind:      apitype.JournalEntryKindSuccess,
+			RemoveNew: &operationID,
+		},
+		"delete new": {
+			Version:   1,
+			Kind:      apitype.JournalEntryKindSuccess,
+			DeleteNew: &operationID,
+		},
+		"pending replacement new": {
+			Version:               1,
+			Kind:                  apitype.JournalEntryKindSuccess,
+			PendingReplacementNew: &operationID,
+		},
+		"refresh remove new": {
+			Version:   1,
+			Kind:      apitype.JournalEntryKindRefreshSuccess,
+			RemoveNew: &operationID,
+		},
+		"outputs remove new": {
+			Version:   1,
+			Kind:      apitype.JournalEntryKindOutputs,
+			RemoveNew: &operationID,
+		},
+	}
+	for name, entry := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := NewJournalReplayer(&apitype.DeploymentV3{}).Add(entry)
+			require.ErrorContains(t, err, "references unknown operation 42")
+		})
 	}
 }
