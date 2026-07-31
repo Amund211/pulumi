@@ -146,10 +146,19 @@ func (se *stepExecutor) ExecuteSerial(chain chain) completionToken {
 	// If one is pending, we should exit early - we will shortly be tearing down the engine and exiting.
 
 	completion := make(chan bool)
+
+	// Acquire a reader before publishing the chain and keep it held across the channel send. RWMutex locks are not
+	// goroutine-owned, so the worker that receives the chain releases this reader in executeChain after the whole chain
+	// finishes. This prevents exclusive work from overtaking an accepted-but-not-yet-started chain or running between
+	// its steps.
+	se.workerLock.RLock()
 	select {
 	case se.incomingChains <- incomingChain{Chain: chain, CompletionChan: completion}:
+		// The matching RUnlock is deferred by executeChain.
+		return completionToken{channel: completion}
 	case <-se.ctx.Done():
 		close(completion)
+		se.workerLock.RUnlock()
 	}
 
 	return completionToken{channel: completion}
@@ -394,6 +403,8 @@ func (se *stepExecutor) WaitForCompletion() {
 // executeChain executes a chain, one step at a time. If any step in the chain fails to execute, or if the
 // context is canceled, the chain stops execution.
 func (se *stepExecutor) executeChain(workerID int, chain chain) {
+	defer se.workerLock.RUnlock()
+
 	for _, step := range chain {
 		select {
 		case <-se.ctx.Done():
@@ -402,13 +413,7 @@ func (se *stepExecutor) executeChain(workerID int, chain chain) {
 		default:
 		}
 
-		// Take the work lock before executing the step, this uses the "read" side of the lock because we're ok with as
-		// many workers as possible executing steps in parallel.
-		se.workerLock.RLock()
 		err := se.executeStep(workerID, step)
-		// Regardless of error we need to release the lock here.
-		se.workerLock.RUnlock()
-
 		if err != nil {
 			se.log(workerID, "step %v on %v failed, signalling cancellation", step.Op(), step.URN())
 			se.cancelDueToError(err, step)
