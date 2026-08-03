@@ -35,12 +35,15 @@ const (
 
 type selectFunc func(message string, options []string, opts display.Options) (int, error)
 
-var errFallBackToFlatList = errors.New("fall back to the flat template list")
+var (
+	errFallBackToFlatList = errors.New("fall back to the flat template list")
+	errBackToCloud        = errors.New("return to the cloud prompt")
+)
 
-// stepBack reports why the chosen row led nowhere and returns to the previous prompt.
-func stepBack(opts display.Options, format string, a ...any) error {
+// backToCloud reports why the chosen row led nowhere and returns to the cloud prompt.
+func backToCloud(opts display.Options, format string, a ...any) error {
 	fmt.Fprintf(opts.StdoutOrDefault(), format+"\n", a...)
-	return ui.ErrStepBack
+	return errBackToCloud
 }
 
 func surveySelect(message string, options []string, opts display.Options) (int, error) {
@@ -104,42 +107,53 @@ func chooseGuided(
 	}
 
 	rows := cloudRows(cat, orgs)
-	var choice guidedChoice
-	var language string
-	if err := ui.SurveyStack(
-		func() (err error) {
-			choice, err = chooseCloud(rows, t, opts, sel)
-			return err
-		},
-		func() (err error) {
-			if choice.template != nil {
-				return nil
-			}
-			l, err := pick(sel, "Which language would you like to use?", opts,
-				choice.provider.Languages, func(l catalog.Language) string { return l.DisplayName })
-			language = l.ID
-			return err
-		},
-	); err != nil {
-		return nil, err
+	for {
+		row, err := pick(sel, "Which cloud would you like to use?", opts, rows,
+			func(r cloudRow) string { return r.label })
+		if err != nil {
+			return nil, err
+		}
+		template, err := chooseFromRow(row, cat, t, opts, sel)
+		if errors.Is(err, errBackToCloud) {
+			continue
+		}
+		return template, err
 	}
-	if choice.template != nil {
-		return choice.template, nil
-	}
-
-	// The prompts only offer values the catalog can resolve, so a miss here is a broken invariant.
-	template, ok := cat.Resolve(choice.provider.ID, language)
-	if !ok {
-		return nil, fmt.Errorf("no template for provider %q and language %q", choice.provider.ID, language)
-	}
-	return template, nil
 }
 
-// guidedChoice is either a provider that still needs a language, or a registry template chosen
-// directly.
-type guidedChoice struct {
-	provider catalog.Provider
-	template cmdTemplates.Template
+// chooseFromRow resolves the selected cloud row to a template: org and browse-all rows list
+// templates directly, provider rows go through the language prompt.
+func chooseFromRow(
+	row cloudRow, cat *catalog.Catalog[cmdTemplates.Template], t guidedTemplates,
+	opts display.Options, sel selectFunc,
+) (cmdTemplates.Template, error) {
+	provider := row.provider
+	switch row.kind {
+	case rowOrg:
+		return chooseOrgTemplates(row.org, t, opts, sel)
+	case rowBrowseAll:
+		return chooseAllTemplates(t.fetchAll, opts, sel)
+	case rowOther:
+		var err error
+		provider, err = pick(sel, "Which provider would you like to use?", opts, row.providers,
+			func(p catalog.Provider) string { return p.DisplayName })
+		if err != nil {
+			return nil, err
+		}
+	case rowProvider:
+	}
+
+	language, err := pick(sel, "Which language would you like to use?", opts,
+		provider.Languages, func(l catalog.Language) string { return l.DisplayName })
+	if err != nil {
+		return nil, err
+	}
+	// The prompts only offer values the catalog can resolve, so a miss here is a broken invariant.
+	template, ok := cat.Resolve(provider.ID, language.ID)
+	if !ok {
+		return nil, fmt.Errorf("no template for provider %q and language %q", provider.ID, language.ID)
+	}
+	return template, nil
 }
 
 type rowKind int
@@ -202,50 +216,15 @@ func cloudRows(cat *catalog.Catalog[cmdTemplates.Template], orgs []string) []clo
 	return rows
 }
 
-// chooseCloud runs the cloud prompt and its dispatch in a SurveyStack of their own, nested inside
-// chooseGuided's outer stack: an interrupt in a dispatch sub-prompt (a template list, the Other
-// providers) steps back to the cloud prompt here, while an interrupt at the language step lands on
-// this whole function, skipping over the non-prompting dispatch step that would otherwise bounce
-// the interrupt around.
-func chooseCloud(
-	rows []cloudRow, t guidedTemplates, opts display.Options, sel selectFunc,
-) (guidedChoice, error) {
-	var row cloudRow
-	var choice guidedChoice
-	err := ui.SurveyStack(
-		func() (err error) {
-			row, err = pick(sel, "Which cloud would you like to use?", opts, rows,
-				func(r cloudRow) string { return r.label })
-			return err
-		},
-		func() (err error) {
-			choice = guidedChoice{}
-			switch row.kind {
-			case rowProvider:
-				choice.provider = row.provider
-			case rowOther:
-				choice.provider, err = pick(sel, "Which provider would you like to use?", opts, row.providers,
-					func(p catalog.Provider) string { return p.DisplayName })
-			case rowOrg:
-				choice.template, err = chooseOrgTemplates(row.org, t, opts, sel)
-			case rowBrowseAll:
-				choice.template, err = chooseAllTemplates(t.fetchAll, opts, sel)
-			}
-			return err
-		},
-	)
-	return choice, err
-}
-
 // chooseAllTemplates and chooseOrgTemplates are the only rows that need the full template set, so
-// they are also the only ones that can discover it is unavailable. Both step back to the cloud
+// they are also the only ones that can discover it is unavailable. Both return to the cloud
 // prompt rather than abandoning the flow: the provider and language rows still work without it.
 func chooseAllTemplates(
 	fetchAll fetchTemplatesFunc, opts display.Options, sel selectFunc,
 ) (cmdTemplates.Template, error) {
 	all, err := fetchAll()
 	if err != nil {
-		return nil, stepBack(opts, "Could not load the full template list: %v", err)
+		return nil, backToCloud(opts, "Could not load the full template list: %v", err)
 	}
 	return chooseTemplateFromList(sortedForDisplay(all), opts, sel)
 }
@@ -260,7 +239,7 @@ func chooseOrgTemplates(
 	if slices.Contains(t.vcsOrgs, org) {
 		all, err := t.fetchAll()
 		if err != nil {
-			return nil, stepBack(opts, "Could not load templates for organization %q: %v", org, err)
+			return nil, backToCloud(opts, "Could not load templates for organization %q: %v", org, err)
 		}
 		available = all
 	}
@@ -272,7 +251,7 @@ func chooseOrgTemplates(
 		}
 	}
 	if len(orgTemplates) == 0 {
-		return nil, stepBack(opts, "No templates found for organization %q.", org)
+		return nil, backToCloud(opts, "No templates found for organization %q.", org)
 	}
 	return chooseTemplateFromList(orgTemplates, opts, sel)
 }

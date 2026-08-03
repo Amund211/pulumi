@@ -189,16 +189,15 @@ func TestGuidedBrowseAllListsEveryTemplateInline(t *testing.T) {
 	assert.Contains(t, (*offered)[1][1], BrokenTemplateDescription, "broken templates sort last and are marked")
 }
 
-func TestGuidedInterruptInBrowseAllGoesBackToCloudPrompt(t *testing.T) {
+func TestGuidedInterruptInBrowseAllAborts(t *testing.T) {
 	t.Parallel()
 
 	templates := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
-	sel, _ := scriptedSelect(t, optionBrowseAll, terminal.InterruptErr, "AWS", "TypeScript")
+	sel, _ := scriptedSelect(t, optionBrowseAll, terminal.InterruptErr)
 
 	got, err := chooseGuided(guided(templates, fetchOf(templates...)), display.Options{}, sel)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "aws-typescript", got.Name(), "interrupt in the browse-all list must return to the cloud prompt")
+	assert.Nil(t, got)
+	assert.ErrorIs(t, err, terminal.InterruptErr, "Ctrl-C must abort the flow, not navigate")
 }
 
 func TestGuidedNoneJavaIsSplitByBuildSystem(t *testing.T) {
@@ -265,19 +264,18 @@ func TestGuidedFallsBackWhenEverythingIsBroken(t *testing.T) {
 	assert.ErrorIs(t, err, errFallBackToFlatList, "the flat chooser is the only surface that marks broken templates")
 }
 
-func TestGuidedInterruptGoesBackToPreviousStep(t *testing.T) {
+func TestGuidedInterruptAtLanguageStepAborts(t *testing.T) {
 	t.Parallel()
 
 	templates := []cmdTemplates.Template{
 		fakeTemplate{name: "aws-typescript"},
 		fakeTemplate{name: "gcp-go"},
 	}
-	sel, _ := scriptedSelect(t, "AWS", terminal.InterruptErr, "GCP", "Go")
+	sel, _ := scriptedSelect(t, "AWS", terminal.InterruptErr)
 
 	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "gcp-go", got.Name(), "interrupt at the language step must return to the provider step")
+	assert.Nil(t, got)
+	assert.ErrorIs(t, err, terminal.InterruptErr, "Ctrl-C must abort the flow, not navigate")
 }
 
 func TestGuidedInterruptAtFirstStepPropagates(t *testing.T) {
@@ -466,10 +464,14 @@ func TestGuidedLazyFetchRunsOncePerFlow(t *testing.T) {
 	registry := fakeRegistryTemplate{fakeTemplate{name: "vpc"}, "acme"}
 	fetches := 0
 	fetch := func() ([]cmdTemplates.Template, error) {
+		// The org has nothing on the first fetch, sending the flow back to the cloud prompt.
 		fetches++
+		if fetches == 1 {
+			return local, nil
+		}
 		return []cmdTemplates.Template{local[0], registry}, nil
 	}
-	sel, _ := scriptedSelect(t, "acme templates", terminal.InterruptErr, "acme templates", "vpc    ")
+	sel, _ := scriptedSelect(t, "acme templates", "acme templates", "vpc    ")
 
 	got, err := chooseGuided(guidedTemplates{
 		project:  local,
@@ -478,7 +480,7 @@ func TestGuidedLazyFetchRunsOncePerFlow(t *testing.T) {
 	}, display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, "vpc", got.Name(), "interrupt in the org list must return to the cloud prompt")
+	assert.Equal(t, "vpc", got.Name())
 	assert.Equal(t, 2, fetches, "chooseGuided calls the fetcher per selection; memoization is the caller's")
 }
 
