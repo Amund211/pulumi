@@ -43,8 +43,8 @@ func TestErrorsOnNonHTTPBackend(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -77,17 +77,13 @@ func TestGeneratingProjectWithAIPromptSucceeds(t *testing.T) {
 
 	listTemplates := func(
 		ctx context.Context, opts registry.ListTemplatesOptions,
-	) iter.Seq2[apitype.TemplateMetadata, error] {
+	) iter.Seq2[apitype.ListTemplatesResponse, error] {
 		assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-		return func(yield func(apitype.TemplateMetadata, error) bool) {
-			if !yield(apitype.TemplateMetadata{
-				Name:      "name1",
-				Publisher: "publisher1",
-				Source:    "source1",
-			}, nil) {
-				return
-			}
-		}
+		return singlePage(apitype.TemplateMetadata{
+			Name:      "name1",
+			Publisher: "publisher1",
+			Source:    "source1",
+		})
 	}
 
 	mockCurrentBackend(t, &backend.MockBackend{

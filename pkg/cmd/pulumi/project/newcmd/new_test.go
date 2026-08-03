@@ -240,8 +240,8 @@ func TestCreatingProjectWithExistingArgsSpecifiedNameFails(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -270,9 +270,9 @@ func TestCreatingProjectWithExistingPromptedNameFails(t *testing.T) {
 
 	listTemplates := func(
 		ctx context.Context, opts registry.ListTemplatesOptions,
-	) iter.Seq2[apitype.TemplateMetadata, error] {
+	) iter.Seq2[apitype.ListTemplatesResponse, error] {
 		assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-		return func(yield func(apitype.TemplateMetadata, error) bool) {}
+		return singlePage()
 	}
 
 	mockCurrentBackend(t, &backend.MockBackend{
@@ -317,9 +317,9 @@ func TestGeneratingProjectWithExistingArgsSpecifiedNameSucceeds(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
 						assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+						return singlePage()
 					},
 				},
 			}
@@ -362,9 +362,9 @@ func TestGeneratingProjectWithExistingPromptedNameSucceeds(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
 						assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+						return singlePage()
 					},
 				},
 			}
@@ -445,8 +445,8 @@ func TestGeneratingProjectWithInvalidArgsSpecifiedNameFails(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -485,9 +485,9 @@ func TestGeneratingProjectWithInvalidPromptedNameFails(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
 						assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+						return singlePage()
 					},
 				},
 			}
@@ -625,8 +625,8 @@ func TestValidateStackRefAndProjectName(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -703,8 +703,8 @@ func TestProjectExists(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -859,8 +859,8 @@ func TestPulumiNewConflictingProject(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -1052,8 +1052,8 @@ func TestPulumiNewWithOrgTemplates(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}
@@ -1096,6 +1096,13 @@ Available Templates:
 
 func ptr[T any](v T) *T { return &v }
 
+// singlePage answers a template listing with one page holding the given templates.
+func singlePage(templates ...apitype.TemplateMetadata) iter.Seq2[apitype.ListTemplatesResponse, error] {
+	return func(yield func(apitype.ListTemplatesResponse, error) bool) {
+		yield(apitype.ListTemplatesResponse{Templates: templates}, nil)
+	}
+}
+
 //nolint:paralleltest // Sets a mock login manager
 func TestPulumiNewWithRegistryTemplates(t *testing.T) {
 	t.Setenv("PULUMI_DISABLE_REGISTRY_RESOLVE", "false")
@@ -1104,19 +1111,12 @@ func TestPulumiNewWithRegistryTemplates(t *testing.T) {
 		Mock: registry.Mock{
 			ListTemplatesF: func(
 				ctx context.Context, opts registry.ListTemplatesOptions,
-			) iter.Seq2[apitype.TemplateMetadata, error] {
-				return func(yield func(apitype.TemplateMetadata, error) bool) {
-					if !yield(apitype.TemplateMetadata{
-						Name: "template-1", Description: ptr("Describe 1"), Publisher: "Some org",
-					}, nil) {
-						return
-					}
-					if !yield(apitype.TemplateMetadata{
-						Name: "template-2", Description: ptr("Describe 2"), RepoSlug: ptr("some-org/repo"), Source: "github",
-					}, nil) {
-						return
-					}
-				}
+			) iter.Seq2[apitype.ListTemplatesResponse, error] {
+				return singlePage(apitype.TemplateMetadata{
+					Name: "template-1", Description: ptr("Describe 1"), Publisher: "Some org",
+				}, apitype.TemplateMetadata{
+					Name: "template-2", Description: ptr("Describe 2"), RepoSlug: ptr("some-org/repo"), Source: "github",
+				})
 			},
 		},
 	}
@@ -1201,9 +1201,9 @@ func TestPulumiNewWithoutTemplateSupport(t *testing.T) {
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						assert.Equal(t, registry.ListTemplatesOptions{}, opts)
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						require.Len(t, opts.Backing, 1, "browsing splits the listing, one backing per fetch")
+						return singlePage()
 					},
 				},
 			}
@@ -1288,8 +1288,8 @@ resources:
 				Mock: registry.Mock{
 					ListTemplatesF: func(
 						ctx context.Context, opts registry.ListTemplatesOptions,
-					) iter.Seq2[apitype.TemplateMetadata, error] {
-						return func(yield func(apitype.TemplateMetadata, error) bool) {}
+					) iter.Seq2[apitype.ListTemplatesResponse, error] {
+						return singlePage()
 					},
 				},
 			}

@@ -101,46 +101,46 @@ func displayNames(entries []vocab) map[string]string {
 	return m
 }
 
-type Catalog struct {
-	// templateNames maps providerID -> languageID -> the template name that produced it.
-	templateNames map[string]map[string]string
+type Catalog[T any] struct {
+	// templates maps providerID -> languageID -> the template whose name produced the pair.
+	templates map[string]map[string]T
 }
 
-// New derives a catalog from the available template names.
-func New(templateNames []string) *Catalog {
-	names := map[string]map[string]string{}
-	for _, name := range templateNames {
-		providerID, languageID, ok := splitTemplateName(name)
+// New derives a catalog from the available templates and their names.
+func New[T any](templates []T, name func(T) string) *Catalog[T] {
+	byProvider := map[string]map[string]T{}
+	for _, template := range templates {
+		providerID, languageID, ok := splitTemplateName(name(template))
 		if !ok {
 			continue
 		}
 		if _, curated := providerDisplayNames[providerID]; !curated {
 			continue
 		}
-		if names[providerID] == nil {
-			names[providerID] = map[string]string{}
+		if byProvider[providerID] == nil {
+			byProvider[providerID] = map[string]T{}
 		}
-		names[providerID][languageID] = name
+		byProvider[providerID][languageID] = template
 	}
-	return &Catalog{templateNames: names}
+	return &Catalog[T]{templates: byProvider}
 }
 
-func (c *Catalog) Empty() bool {
-	return len(c.templateNames) == 0
+func (c *Catalog[T]) Empty() bool {
+	return len(c.templates) == 0
 }
 
-func (c *Catalog) provider(id string) Provider {
+func (c *Catalog[T]) provider(id string) Provider {
 	return Provider{
 		ID:          id,
 		DisplayName: providerDisplayNames[id],
-		Languages:   buildLanguages(id, c.templateNames[id]),
+		Languages:   buildLanguages(id, c.templates[id]),
 	}
 }
 
-func (c *Catalog) Featured() []Provider {
+func (c *Catalog[T]) Featured() []Provider {
 	providers := make([]Provider, 0, len(featuredProviders))
 	for _, p := range featuredProviders {
-		if _, ok := c.templateNames[p.id]; ok {
+		if _, ok := c.templates[p.id]; ok {
 			providers = append(providers, c.provider(p.id))
 		}
 	}
@@ -148,17 +148,17 @@ func (c *Catalog) Featured() []Provider {
 }
 
 // None returns the pseudo-provider for bare, cloudless templates, if any are available.
-func (c *Catalog) None() (Provider, bool) {
-	if _, ok := c.templateNames[noneProvider]; !ok {
+func (c *Catalog[T]) None() (Provider, bool) {
+	if _, ok := c.templates[noneProvider]; !ok {
 		return Provider{}, false
 	}
 	return c.provider(noneProvider), true
 }
 
-func (c *Catalog) Others() []Provider {
-	providers := make([]Provider, 0, len(c.templateNames))
+func (c *Catalog[T]) Others() []Provider {
+	providers := make([]Provider, 0, len(c.templates))
 	for _, p := range otherProviders {
-		if _, ok := c.templateNames[p.id]; ok {
+		if _, ok := c.templates[p.id]; ok {
 			providers = append(providers, c.provider(p.id))
 		}
 	}
@@ -166,9 +166,9 @@ func (c *Catalog) Others() []Provider {
 	return providers
 }
 
-func (c *Catalog) Resolve(providerID, languageID string) (string, bool) {
-	name, ok := c.templateNames[providerID][languageID]
-	return name, ok
+func (c *Catalog[T]) Resolve(providerID, languageID string) (T, bool) {
+	template, ok := c.templates[providerID][languageID]
+	return template, ok
 }
 
 // splitTemplateName decomposes a template name into its provider and language. The longest known
@@ -190,7 +190,7 @@ func splitTemplateName(name string) (providerID, languageID string, ok bool) {
 	return name[:len(name)-len(best)-1], best, true
 }
 
-func buildLanguages(providerID string, byLanguage map[string]string) []Language {
+func buildLanguages[T any](providerID string, byLanguage map[string]T) []Language {
 	langs := make([]Language, 0, len(byLanguage))
 	for _, l := range languages {
 		if _, ok := byLanguage[l.id]; ok {

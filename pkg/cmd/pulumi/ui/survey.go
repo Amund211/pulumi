@@ -44,21 +44,27 @@ func SurveyIcons(color colors.Colorization) survey.AskOpt {
 	})
 }
 
+// ErrStepBack asks [SurveyStack] to return to the previous interaction, for a choice that turns
+// out to lead nowhere. Interactions signal it by returning an error wrapping ErrStepBack.
+var ErrStepBack = errors.New("step back to the previous prompt")
+
 // Ask multiple survey based questions.
 //
 // Ctrl-C will go back in the stack, and valid answers will go forward.
+// An interaction may also step back deliberately by returning an error wrapping
+// [ErrStepBack], for a choice that turns out to lead nowhere.
 func SurveyStack(interactions ...func() error) error {
 	for i := 0; i < len(interactions); {
 		err := interactions[i]()
-		switch err {
+		switch {
 		// No error, so go to the next interaction.
-		case nil:
+		case err == nil:
 			i++
-		// We have received an interrupt, so go back to the previous interaction.
-		case terminal.InterruptErr:
-			// If we have received in interrupt at the beginning of the stack,
-			// the user has asked to go back to before the stack. We can't do
-			// that, so we just return the interrupt.
+		// A user interrupt or a deliberate step-back, so go back to the previous interaction.
+		case errors.Is(err, terminal.InterruptErr), errors.Is(err, ErrStepBack):
+			// At the beginning of the stack there is nothing to go back to, so return the
+			// error: an interrupt for the caller to treat as cancellation, a step-back for an
+			// enclosing stack to continue stepping back through.
 			if i == 0 {
 				return err
 			}

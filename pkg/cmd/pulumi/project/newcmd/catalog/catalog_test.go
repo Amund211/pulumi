@@ -34,11 +34,16 @@ var testTemplateNames = []string{
 	"aws-hcl", "hcl",
 }
 
-func testCatalog() *Catalog { return New(testTemplateNames) }
+// newFromNames builds a catalog whose templates are their own names.
+func newFromNames(names []string) *Catalog[string] {
+	return New(names, func(name string) string { return name })
+}
 
-func languageNames(t *testing.T, cat *Catalog, providerID string) []string {
+func testCatalog() *Catalog[string] { return newFromNames(testTemplateNames) }
+
+func languageNames(t *testing.T, cat *Catalog[string], providerID string) []string {
 	t.Helper()
-	require.Contains(t, cat.templateNames, providerID)
+	require.Contains(t, cat.templates, providerID)
 	p := cat.provider(providerID)
 	names := make([]string, len(p.Languages))
 	for i, l := range p.Languages {
@@ -65,7 +70,7 @@ func TestNoneIsItsOwnPseudoProvider(t *testing.T) {
 	assert.Equal(t, "none", none.ID)
 	assert.Equal(t, "None", none.DisplayName)
 
-	_, ok = New([]string{"aws-typescript"}).None()
+	_, ok = newFromNames([]string{"aws-typescript"}).None()
 	assert.False(t, ok, "None must be absent when there are no bare templates")
 }
 
@@ -231,29 +236,29 @@ func TestSplitTemplateName(t *testing.T) {
 func TestEmptyCatalog(t *testing.T) {
 	t.Parallel()
 
-	assert.True(t, New(nil).Empty())
-	assert.True(t, New([]string{"vpc-baseline", "scripts"}).Empty(), "unparseable names yield no providers")
+	assert.True(t, newFromNames(nil).Empty())
+	assert.True(t, newFromNames([]string{"vpc-baseline", "scripts"}).Empty(), "unparseable names yield no providers")
 	assert.False(t, testCatalog().Empty())
 }
 
 func TestUncuratedProviderStaysOutOfCatalog(t *testing.T) {
 	t.Parallel()
 
-	cat := New([]string{"newcloud-go"})
+	cat := newFromNames([]string{"newcloud-go"})
 	assert.True(t, cat.Empty(), "an uncurated provider must fall through to Browse all templates")
 }
 
 func TestCompoundTemplateNamesStayOutOfCatalog(t *testing.T) {
 	t.Parallel()
 
-	cat := New([]string{
+	cat := newFromNames([]string{
 		"aws-typescript", "kubernetes-go",
 		"container-aws-typescript", "kubernetes-aws-go", "esc-connector-lambda-python", "vm-gcp-csharp",
 	})
 
 	for _, id := range []string{"container-aws", "kubernetes-aws", "esc-connector-lambda", "vm-gcp"} {
-		assert.NotContains(t, cat.templateNames, id, "%s must not be minted as a provider", id)
+		assert.NotContains(t, cat.templates, id, "%s must not be minted as a provider", id)
 	}
-	assert.Contains(t, cat.templateNames, "aws")
-	assert.Contains(t, cat.templateNames, "kubernetes", "plain kubernetes is curated and must stay")
+	assert.Contains(t, cat.templates, "aws")
+	assert.Contains(t, cat.templates, "kubernetes", "plain kubernetes is curated and must stay")
 }

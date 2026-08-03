@@ -88,7 +88,7 @@ type newArgs struct {
 	languageTemplate      languageTemplateFunc
 	promptForAIProjectURL promptForAIProjectURLFunc
 	chooseTemplate        chooseTemplateFunc
-	chooseTemplateGuided  chooseTemplateFunc
+	chooseTemplateGuided  chooseTemplateGuidedFunc
 	secretsProvider       string
 	stack                 string
 	templateNameOrURL     string
@@ -113,9 +113,6 @@ func runNew(ctx context.Context, args newArgs) error {
 	}
 	if args.stderr == nil {
 		args.stderr = io.Discard
-	}
-	if args.chooseTemplateGuided == nil {
-		args.chooseTemplateGuided = args.chooseTemplate
 	}
 	if args.promptForAIProjectURL == nil {
 		args.promptForAIProjectURL = func(context.Context, pkgWorkspace.Context, newArgs, display.Options,
@@ -209,23 +206,11 @@ func runNew(ctx context.Context, args newArgs) error {
 		args.templateNameOrURL, scope, cmdTemplates.TemplateKindPulumiProject, env.Global())
 	defer contract.IgnoreClose(templateSource)
 
-	// List the templates from the repo.
-	templates, err := templateSource.Templates()
+	// The guided flow renders its first prompt without waiting on the VCS collections the service
+	// has to fetch upstream, and only waits for them once a selection needs them.
+	cmdTemplate, err := args.templateChooser()(templateSource, opts)
 	if err != nil {
 		return err
-	}
-
-	var cmdTemplate cmdTemplates.Template
-	if len(templates) == 0 {
-		if !args.yes {
-			return errors.New("no templates")
-		}
-	} else if len(templates) == 1 {
-		cmdTemplate = templates[0]
-	} else if !args.yes {
-		if cmdTemplate, err = args.templateChooser()(templates, opts); err != nil {
-			return err
-		}
 	}
 
 	var template cmdTemplates.ProjectTemplate
@@ -539,15 +524,6 @@ func runNew(ctx context.Context, args newArgs) error {
 	}
 
 	return nil
-}
-
-// templateChooser picks the guided provider/language flow only when the user named no template at all.
-// Any named template or URL already narrows the choice, so those disambiguate against the flat list.
-func (args newArgs) templateChooser() chooseTemplateFunc {
-	if args.templateNameOrURL == "" {
-		return args.chooseTemplateGuided
-	}
-	return args.chooseTemplate
 }
 
 // isInteractive lets us force interactive mode for testing by setting PULUMI_TEST_INTERACTIVE.

@@ -15,6 +15,7 @@
 package newcmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -34,11 +35,11 @@ type fakeTemplate struct {
 	err  error
 }
 
-func (f fakeTemplate) Name() string              { return f.name }
-func (f fakeTemplate) DisplayName() string       { return f.name }
-func (f fakeTemplate) Description() string       { return f.desc }
-func (f fakeTemplate) Error() error              { return f.err }
-func (f fakeTemplate) Publisher() (string, bool) { return "", false }
+func (f fakeTemplate) Name() string        { return f.name }
+func (f fakeTemplate) DisplayName() string { return f.name }
+func (f fakeTemplate) Description() string { return f.desc }
+func (f fakeTemplate) Error() error        { return f.err }
+func (f fakeTemplate) Publisher() string   { return "" }
 func (f fakeTemplate) Download(ctx context.Context) (cmdTemplates.ProjectTemplate, error) {
 	return cmdTemplates.ProjectTemplate{}, nil
 }
@@ -48,7 +49,7 @@ type fakeRegistryTemplate struct {
 	publisher string
 }
 
-func (f fakeRegistryTemplate) Publisher() (string, bool) { return f.publisher, true }
+func (f fakeRegistryTemplate) Publisher() string { return f.publisher }
 
 // scriptedSelect answers each prompt in order, asserting the option offered is present. An error
 // entry is returned from the prompt as-is.
@@ -70,6 +71,24 @@ func scriptedSelect(t *testing.T, answers ...any) (selectFunc, *[]([]string)) {
 	}, &offered
 }
 
+// noFetch fails the test if the full template fetch is triggered; provider/language selections
+// must resolve from the project templates alone, never waiting on the templates API.
+func noFetch(t *testing.T) fetchTemplatesFunc {
+	return func() ([]cmdTemplates.Template, error) {
+		t.Error("the full template fetch must not run for this path")
+		return nil, nil
+	}
+}
+
+func fetchOf(templates ...cmdTemplates.Template) fetchTemplatesFunc {
+	return func() ([]cmdTemplates.Template, error) { return templates, nil }
+}
+
+// guided assembles the inputs for a flow whose rows all come from the project templates.
+func guided(project []cmdTemplates.Template, fetchAll fetchTemplatesFunc) guidedTemplates {
+	return guidedTemplates{project: project, fetchAll: fetchAll}
+}
+
 func TestGuidedResolvesFeaturedProvider(t *testing.T) {
 	t.Parallel()
 
@@ -80,7 +99,7 @@ func TestGuidedResolvesFeaturedProvider(t *testing.T) {
 	}
 	sel, _ := scriptedSelect(t, "AWS", "TypeScript")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "aws-typescript", got.Name())
@@ -92,7 +111,7 @@ func TestGuidedShowsNoRegistryRowsWithoutRegistryTemplates(t *testing.T) {
 	templates := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
 	sel, offered := scriptedSelect(t, "AWS", "TypeScript")
 
-	_, err := chooseGuided(templates, display.Options{}, sel)
+	_, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.Len(t, *offered, 2, "expected exactly cloud + language prompts")
 	assert.Equal(t, []string{"AWS", optionBrowseAll}, (*offered)[0],
@@ -105,7 +124,7 @@ func TestGuidedOtherExpandsToSecondProviderList(t *testing.T) {
 	templates := []cmdTemplates.Template{fakeTemplate{name: "linode-go"}}
 	sel, offered := scriptedSelect(t, optionOther, "Linode", "Go")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "linode-go", got.Name())
@@ -125,7 +144,7 @@ func TestGuidedNoneResolvesToBareTemplate(t *testing.T) {
 	}
 	sel, offered := scriptedSelect(t, "None", "TypeScript")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "typescript", got.Name())
@@ -145,7 +164,7 @@ func TestGuidedNonePositionInCloudPrompt(t *testing.T) {
 	}
 	sel, offered := scriptedSelect(t, "None", "TypeScript")
 
-	_, err := chooseGuided(templates, display.Options{}, sel)
+	_, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"AWS", "Azure", "GCP", optionOther, "None", optionBrowseAll}, (*offered)[0],
 		"None sits below Other so the curated providers stay adjacent")
@@ -160,7 +179,7 @@ func TestGuidedBrowseAllListsEveryTemplateInline(t *testing.T) {
 	}
 	sel, offered := scriptedSelect(t, optionBrowseAll, "aws-typescript    ")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, fetchOf(templates...)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "aws-typescript", got.Name())
@@ -176,7 +195,7 @@ func TestGuidedInterruptInBrowseAllGoesBackToCloudPrompt(t *testing.T) {
 	templates := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
 	sel, _ := scriptedSelect(t, optionBrowseAll, terminal.InterruptErr, "AWS", "TypeScript")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, fetchOf(templates...)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "aws-typescript", got.Name(), "interrupt in the browse-all list must return to the cloud prompt")
@@ -191,7 +210,7 @@ func TestGuidedNoneJavaIsSplitByBuildSystem(t *testing.T) {
 	}
 	sel, offered := scriptedSelect(t, "None", "Java (Gradle)")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "java-gradle", got.Name())
@@ -206,7 +225,7 @@ func TestGuidedLanguageListIsFilteredToProvider(t *testing.T) {
 	templates := []cmdTemplates.Template{fakeTemplate{name: "azure-typescript"}}
 	sel, offered := scriptedSelect(t, "Azure", "TypeScript")
 
-	_, err := chooseGuided(templates, display.Options{}, sel)
+	_, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.Len(t, *offered, 2)
 	assert.NotContains(t, (*offered)[1], "Scala", "Azure has no scala template")
@@ -222,7 +241,7 @@ func TestGuidedExcludesBrokenTemplates(t *testing.T) {
 	}
 	sel, offered := scriptedSelect(t, "AWS", "TypeScript")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "aws-typescript", got.Name())
@@ -232,16 +251,16 @@ func TestGuidedExcludesBrokenTemplates(t *testing.T) {
 func TestGuidedFallsBackWhenEverythingIsBroken(t *testing.T) {
 	t.Parallel()
 
-	templates := []cmdTemplates.Template{
-		fakeTemplate{name: "aws-typescript", err: errors.New("boom")},
-		fakeRegistryTemplate{fakeTemplate{name: "vpc", err: errors.New("boom")}, "acme"},
-	}
 	sel := func(string, []string, display.Options) (int, error) {
 		t.Error("no prompt may be shown when every template is broken")
 		return 0, nil
 	}
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guidedTemplates{
+		project:  []cmdTemplates.Template{fakeTemplate{name: "aws-typescript", err: errors.New("boom")}},
+		registry: []cmdTemplates.Template{fakeRegistryTemplate{fakeTemplate{name: "vpc", err: errors.New("boom")}, "acme"}},
+		fetchAll: noFetch(t),
+	}, display.Options{}, sel)
 	assert.Nil(t, got)
 	assert.ErrorIs(t, err, errFallBackToFlatList, "the flat chooser is the only surface that marks broken templates")
 }
@@ -255,7 +274,7 @@ func TestGuidedInterruptGoesBackToPreviousStep(t *testing.T) {
 	}
 	sel, _ := scriptedSelect(t, "AWS", terminal.InterruptErr, "GCP", "Go")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "gcp-go", got.Name(), "interrupt at the language step must return to the provider step")
@@ -269,81 +288,198 @@ func TestGuidedInterruptAtFirstStepPropagates(t *testing.T) {
 		return 0, terminal.InterruptErr
 	}
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	assert.Nil(t, got)
 	assert.ErrorIs(t, err, terminal.InterruptErr)
 }
 
-func TestGuidedOrgRowOpensRegistryTemplatesAndSkipsLanguage(t *testing.T) {
+func TestGuidedOrgRowOpensOrgTemplatesAndSkipsLanguage(t *testing.T) {
 	t.Parallel()
 
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
 	registry := fakeRegistryTemplate{fakeTemplate{name: "vpc-baseline", desc: "A baseline VPC"}, "acme"}
-	templates := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}, registry}
-	sel, offered := scriptedSelect(t, "acme templates (1)", "vpc-baseline    A baseline VPC")
+	sel, offered := scriptedSelect(t, "acme templates", "vpc-baseline    A baseline VPC")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guidedTemplates{
+		project:  local,
+		vcsOrgs:  []string{"acme"},
+		fetchAll: fetchOf(local[0], registry),
+	}, display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "vpc-baseline", got.Name())
 
 	require.Len(t, *offered, 2, "org path should be cloud prompt + template list, no language prompt")
-	assert.Equal(t, []string{"AWS", "acme templates (1)", optionBrowseAll}, (*offered)[0],
+	assert.Equal(t, []string{"AWS", "acme templates", optionBrowseAll}, (*offered)[0],
 		"org rows sit between the providers and Browse all")
 }
 
-func TestGuidedGroupsRegistryRowsByPublisher(t *testing.T) {
+func TestGuidedRegistryOnlyOrgRowNeedsNoUpstreamFetch(t *testing.T) {
 	t.Parallel()
 
-	templates := []cmdTemplates.Template{
-		fakeTemplate{name: "aws-typescript"},
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	registry := []cmdTemplates.Template{
+		fakeRegistryTemplate{fakeTemplate{name: "vpc-baseline", desc: "A baseline VPC"}, "acme"},
+	}
+	sel, offered := scriptedSelect(t, "acme templates", "vpc-baseline    A baseline VPC")
+
+	got, err := chooseGuided(guidedTemplates{
+		project:  local,
+		registry: registry,
+		fetchAll: noFetch(t),
+	}, display.Options{}, sel)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "vpc-baseline", got.Name())
+
+	assert.Equal(t, []string{"AWS", "acme templates", optionBrowseAll}, (*offered)[0],
+		"an org that published to the registry earns a row without the service reporting a collection")
+}
+
+func TestGuidedOrgRowsMergeRegistryPublishersAndVcsSources(t *testing.T) {
+	t.Parallel()
+
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	registry := []cmdTemplates.Template{
+		fakeRegistryTemplate{fakeTemplate{name: "vpc"}, "globex"},
+		fakeRegistryTemplate{fakeTemplate{name: "eks"}, "acme"},
+		fakeRegistryTemplate{fakeTemplate{name: "broken", err: errors.New("boom")}, "initech"},
+		fakeRegistryTemplate{fakeTemplate{name: "legacy"}, ""},
+	}
+	sel, offered := scriptedSelect(t, terminal.InterruptErr)
+
+	_, err := chooseGuided(guidedTemplates{
+		project:  local,
+		registry: registry,
+		vcsOrgs:  []string{"acme", "umbrella"},
+		fetchAll: noFetch(t),
+	}, display.Options{}, sel)
+	assert.ErrorIs(t, err, terminal.InterruptErr)
+
+	assert.Equal(t, []string{
+		"AWS", "acme templates", "globex templates", "umbrella templates", optionBrowseAll,
+	}, (*offered)[0], "each org appears once, sorted; a publisher-less or broken template earns no row")
+}
+
+func TestGuidedOrgRowListsOnlyThatOrg(t *testing.T) {
+	t.Parallel()
+
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	all := []cmdTemplates.Template{
+		local[0],
 		fakeRegistryTemplate{fakeTemplate{name: "vpc"}, "globex"},
 		fakeRegistryTemplate{fakeTemplate{name: "eks"}, "acme"},
 		fakeRegistryTemplate{fakeTemplate{name: "gke"}, "acme"},
 		fakeRegistryTemplate{fakeTemplate{name: "legacy"}, ""},
 	}
-	sel, offered := scriptedSelect(t, "acme templates (2)", "eks    ")
+	sel, offered := scriptedSelect(t, "acme templates", "eks    ")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guidedTemplates{
+		project:  local,
+		vcsOrgs:  []string{"acme", "globex"},
+		fetchAll: fetchOf(all...),
+	}, display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "eks", got.Name())
 
 	assert.Equal(t, []string{
-		"AWS", "Registry templates (1)", "acme templates (2)", "globex templates (1)", optionBrowseAll,
-	}, (*offered)[0], "one row per publisher, sorted, unpublished group labeled generically")
+		"AWS", "acme templates", "globex templates", optionBrowseAll,
+	}, (*offered)[0], "one row per org, sorted")
 	assert.Equal(t, []string{"eks    ", "gke    "}, (*offered)[1], "org row lists only that org's templates")
 }
 
-func TestGuidedRegistryOnlyOffersPublisherRowsAndBrowseAll(t *testing.T) {
+func TestGuidedOrgRowsOnlyWithEmptyCatalog(t *testing.T) {
 	t.Parallel()
 
-	templates := []cmdTemplates.Template{
-		fakeRegistryTemplate{fakeTemplate{name: "vpc", desc: "A VPC"}, "acme"},
-	}
-	sel, offered := scriptedSelect(t, "acme templates (1)", "vpc    A VPC")
+	registry := fakeRegistryTemplate{fakeTemplate{name: "vpc", desc: "A VPC"}, "acme"}
+	sel, offered := scriptedSelect(t, "acme templates", "vpc    A VPC")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guidedTemplates{
+		vcsOrgs:  []string{"acme"},
+		fetchAll: fetchOf(registry),
+	}, display.Options{}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "vpc", got.Name())
 
-	assert.Equal(t, []string{"acme templates (1)", optionBrowseAll}, (*offered)[0],
+	assert.Equal(t, []string{"acme templates", optionBrowseAll}, (*offered)[0],
 		"an empty catalog still goes through the cloud prompt so Browse all stays reachable")
 }
 
-func TestGuidedInterruptInRegistryListGoesBackToCloudPrompt(t *testing.T) {
+func TestGuidedEmptyOrgRowNotesAndReturnsToCloudPrompt(t *testing.T) {
 	t.Parallel()
 
-	templates := []cmdTemplates.Template{
-		fakeTemplate{name: "aws-typescript"},
-		fakeRegistryTemplate{fakeTemplate{name: "vpc"}, "acme"},
-	}
-	sel, _ := scriptedSelect(t, "acme templates (1)", terminal.InterruptErr, "AWS", "TypeScript")
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	sel, _ := scriptedSelect(t, "acme templates", "AWS", "TypeScript")
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	var notice bytes.Buffer
+	got, err := chooseGuided(guidedTemplates{
+		project:  local,
+		vcsOrgs:  []string{"acme"},
+		fetchAll: fetchOf(local...),
+	}, display.Options{Stdout: &notice}, sel)
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, "aws-typescript", got.Name(), "interrupt in the registry list must return to the cloud prompt")
+	assert.Equal(t, "aws-typescript", got.Name(),
+		"an org row with no templates must return to the cloud prompt")
+	assert.Contains(t, notice.String(), `No templates found for organization "acme"`)
+}
+
+func TestGuidedUnavailableTemplatesReturnToCloudPrompt(t *testing.T) {
+	t.Parallel()
+
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	failed := func() ([]cmdTemplates.Template, error) { return nil, errors.New("service unreachable") }
+
+	for _, tt := range []struct {
+		name   string
+		row    string
+		notice string
+	}{
+		{"org row", "acme templates", `Could not load templates for organization "acme": service unreachable`},
+		{"browse all", optionBrowseAll, "Could not load the full template list: service unreachable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sel, _ := scriptedSelect(t, tt.row, "AWS", "TypeScript")
+			var notice bytes.Buffer
+			got, err := chooseGuided(guidedTemplates{
+				project:  local,
+				vcsOrgs:  []string{"acme"},
+				fetchAll: failed,
+			}, display.Options{Stdout: &notice}, sel)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, "aws-typescript", got.Name(),
+				"a row that cannot load templates must return to the cloud prompt, not abandon the flow")
+			assert.Contains(t, notice.String(), tt.notice)
+		})
+	}
+}
+
+func TestGuidedLazyFetchRunsOncePerFlow(t *testing.T) {
+	t.Parallel()
+
+	local := []cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}}
+	registry := fakeRegistryTemplate{fakeTemplate{name: "vpc"}, "acme"}
+	fetches := 0
+	fetch := func() ([]cmdTemplates.Template, error) {
+		fetches++
+		return []cmdTemplates.Template{local[0], registry}, nil
+	}
+	sel, _ := scriptedSelect(t, "acme templates", terminal.InterruptErr, "acme templates", "vpc    ")
+
+	got, err := chooseGuided(guidedTemplates{
+		project:  local,
+		vcsOrgs:  []string{"acme"},
+		fetchAll: fetch,
+	}, display.Options{}, sel)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "vpc", got.Name(), "interrupt in the org list must return to the cloud prompt")
+	assert.Equal(t, 2, fetches, "chooseGuided calls the fetcher per selection; memoization is the caller's")
 }
 
 func TestChooseTemplateFromListLabelsIncludeDescription(t *testing.T) {
@@ -394,7 +530,7 @@ func TestGuidedFallsBackWhenNothingIsCurated(t *testing.T) {
 		return 0, nil
 	}
 
-	got, err := chooseGuided(templates, display.Options{}, sel)
+	got, err := chooseGuided(guided(templates, noFetch(t)), display.Options{}, sel)
 	assert.Nil(t, got)
 	assert.ErrorIs(t, err, errFallBackToFlatList)
 }

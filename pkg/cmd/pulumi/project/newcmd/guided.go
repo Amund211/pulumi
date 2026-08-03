@@ -17,7 +17,7 @@ package newcmd
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 
 	survey "github.com/AlecAivazis/survey/v2"
 
@@ -36,6 +36,12 @@ const (
 type selectFunc func(message string, options []string, opts display.Options) (int, error)
 
 var errFallBackToFlatList = errors.New("fall back to the flat template list")
+
+// stepBack reports why the chosen row led nowhere and returns to the previous prompt.
+func stepBack(opts display.Options, format string, a ...any) error {
+	fmt.Fprintf(opts.StdoutOrDefault(), format+"\n", a...)
+	return ui.ErrStepBack
+}
 
 func surveySelect(message string, options []string, opts display.Options) (int, error) {
 	return ui.PromptUserIndexErr("\r"+message+"\n", options, opts.Color,
@@ -65,36 +71,44 @@ func pick[T any](
 	return items[i], nil
 }
 
+// fetchTemplatesFunc blocks until the full template set — including the VCS collections the
+// service fetches upstream — is available.
+type fetchTemplatesFunc func() ([]cmdTemplates.Template, error)
+
+// guidedTemplates is what the guided prompts are built from. project and registry come from
+// fetches that are fast enough to hold up the first prompt; fetchAll covers the rest and is only
+// called for a row that cannot be answered without it.
+type guidedTemplates struct {
+	project  []cmdTemplates.Template
+	registry []cmdTemplates.Template
+	vcsOrgs  []string
+	fetchAll fetchTemplatesFunc
+}
+
 func chooseGuided(
-	templates []cmdTemplates.Template, opts display.Options, sel selectFunc,
+	t guidedTemplates, opts display.Options, sel selectFunc,
 ) (cmdTemplates.Template, error) {
-	byName := make(map[string]cmdTemplates.Template, len(templates))
-	var registryTemplates []cmdTemplates.Template
-	curatedNames := make([]string, 0, len(templates))
-	for _, t := range templates {
-		// Broken templates are only offered by the flat chooser.
-		if t.Error() != nil {
+	curated := make([]cmdTemplates.Template, 0, len(t.project))
+	for _, template := range t.project {
+		// A broken template can't back a provider/language row. Browse all still lists it, marked.
+		if template.Error() != nil {
 			continue
 		}
-		if _, fromRegistry := t.Publisher(); fromRegistry {
-			registryTemplates = append(registryTemplates, t)
-		} else {
-			byName[t.Name()] = t
-			curatedNames = append(curatedNames, t.Name())
-		}
+		curated = append(curated, template)
 	}
 
-	cat := catalog.New(curatedNames)
-	if cat.Empty() && len(registryTemplates) == 0 {
+	cat := catalog.New(curated, cmdTemplates.Template.Name)
+	orgs := t.orgRows()
+	if cat.Empty() && len(orgs) == 0 {
 		return nil, errFallBackToFlatList
 	}
 
-	rows := cloudRows(cat, registryTemplates, templates)
+	rows := cloudRows(cat, orgs)
 	var choice guidedChoice
 	var language string
 	if err := ui.SurveyStack(
 		func() (err error) {
-			choice, err = chooseCloud(rows, opts, sel)
+			choice, err = chooseCloud(rows, t, opts, sel)
 			return err
 		},
 		func() (err error) {
@@ -114,13 +128,9 @@ func chooseGuided(
 	}
 
 	// The prompts only offer values the catalog can resolve, so a miss here is a broken invariant.
-	name, ok := cat.Resolve(choice.provider.ID, language)
+	template, ok := cat.Resolve(choice.provider.ID, language)
 	if !ok {
 		return nil, fmt.Errorf("no template for provider %q and language %q", choice.provider.ID, language)
-	}
-	template, ok := byName[name]
-	if !ok {
-		return nil, fmt.Errorf("template %q is missing from the available set", name)
 	}
 	return template, nil
 }
@@ -136,22 +146,46 @@ type rowKind int
 
 const (
 	rowProvider rowKind = iota
-	rowRegistry
 	rowOther
+	rowOrg
 	rowBrowseAll
 )
 
 type cloudRow struct {
 	kind      rowKind
 	label     string
-	provider  catalog.Provider        // rowProvider
-	providers []catalog.Provider      // rowOther
-	templates []cmdTemplates.Template // rowRegistry and rowBrowseAll
+	provider  catalog.Provider   // rowProvider
+	providers []catalog.Provider // rowOther
+	org       string             // rowOrg
 }
 
-func cloudRows(cat *catalog.Catalog, registryTemplates, all []cmdTemplates.Template) []cloudRow {
+// registryPublisher returns the organization that published a usable registry template.
+func registryPublisher(t cmdTemplates.Template) (string, bool) {
+	if t.Error() != nil {
+		return "", false
+	}
+	publisher := t.Publisher()
+	return publisher, publisher != ""
+}
+
+// orgRows names the organizations worth offering a row for: those that published templates to the
+// registry, and those the service reports as having VCS collections, whose templates nothing has
+// fetched yet. Both signals come from the database, so an organization can turn out to have
+// nothing to show.
+func (t guidedTemplates) orgRows() []string {
+	names := slices.Clone(t.vcsOrgs)
+	for _, template := range t.registry {
+		if publisher, ok := registryPublisher(template); ok {
+			names = append(names, publisher)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+func cloudRows(cat *catalog.Catalog[cmdTemplates.Template], orgs []string) []cloudRow {
 	featured := cat.Featured()
-	rows := make([]cloudRow, 0, len(featured)+3)
+	rows := make([]cloudRow, 0, len(featured)+len(orgs)+3)
 	for _, p := range featured {
 		rows = append(rows, cloudRow{kind: rowProvider, label: p.DisplayName, provider: p})
 	}
@@ -161,32 +195,10 @@ func cloudRows(cat *catalog.Catalog, registryTemplates, all []cmdTemplates.Templ
 	if none, ok := cat.None(); ok {
 		rows = append(rows, cloudRow{kind: rowProvider, label: none.DisplayName, provider: none})
 	}
-	rows = append(rows, registryRows(registryTemplates)...)
-	rows = append(rows, cloudRow{kind: rowBrowseAll, label: optionBrowseAll, templates: sortedForDisplay(all)})
-	return rows
-}
-
-func registryRows(registryTemplates []cmdTemplates.Template) []cloudRow {
-	byPublisher := map[string][]cmdTemplates.Template{}
-	for _, t := range registryTemplates {
-		publisher, _ := t.Publisher()
-		byPublisher[publisher] = append(byPublisher[publisher], t)
+	for _, org := range orgs {
+		rows = append(rows, cloudRow{kind: rowOrg, label: org + " templates", org: org})
 	}
-	publishers := make([]string, 0, len(byPublisher))
-	for publisher := range byPublisher {
-		publishers = append(publishers, publisher)
-	}
-	sort.Strings(publishers)
-
-	rows := make([]cloudRow, 0, len(byPublisher))
-	for _, publisher := range publishers {
-		group := byPublisher[publisher]
-		label := fmt.Sprintf("%s templates (%d)", publisher, len(group))
-		if publisher == "" {
-			label = fmt.Sprintf("Registry templates (%d)", len(group))
-		}
-		rows = append(rows, cloudRow{kind: rowRegistry, label: label, templates: group})
-	}
+	rows = append(rows, cloudRow{kind: rowBrowseAll, label: optionBrowseAll})
 	return rows
 }
 
@@ -195,7 +207,9 @@ func registryRows(registryTemplates []cmdTemplates.Template) []cloudRow {
 // providers) steps back to the cloud prompt here, while an interrupt at the language step lands on
 // this whole function, skipping over the non-prompting dispatch step that would otherwise bounce
 // the interrupt around.
-func chooseCloud(rows []cloudRow, opts display.Options, sel selectFunc) (guidedChoice, error) {
+func chooseCloud(
+	rows []cloudRow, t guidedTemplates, opts display.Options, sel selectFunc,
+) (guidedChoice, error) {
 	var row cloudRow
 	var choice guidedChoice
 	err := ui.SurveyStack(
@@ -212,13 +226,55 @@ func chooseCloud(rows []cloudRow, opts display.Options, sel selectFunc) (guidedC
 			case rowOther:
 				choice.provider, err = pick(sel, "Which provider would you like to use?", opts, row.providers,
 					func(p catalog.Provider) string { return p.DisplayName })
-			case rowRegistry, rowBrowseAll:
-				choice.template, err = chooseTemplateFromList(row.templates, opts, sel)
+			case rowOrg:
+				choice.template, err = chooseOrgTemplates(row.org, t, opts, sel)
+			case rowBrowseAll:
+				choice.template, err = chooseAllTemplates(t.fetchAll, opts, sel)
 			}
 			return err
 		},
 	)
 	return choice, err
+}
+
+// chooseAllTemplates and chooseOrgTemplates are the only rows that need the full template set, so
+// they are also the only ones that can discover it is unavailable. Both step back to the cloud
+// prompt rather than abandoning the flow: the provider and language rows still work without it.
+func chooseAllTemplates(
+	fetchAll fetchTemplatesFunc, opts display.Options, sel selectFunc,
+) (cmdTemplates.Template, error) {
+	all, err := fetchAll()
+	if err != nil {
+		return nil, stepBack(opts, "Could not load the full template list: %v", err)
+	}
+	return chooseTemplateFromList(sortedForDisplay(all), opts, sel)
+}
+
+// chooseOrgTemplates offers an organization's templates. An organization with no VCS collections
+// is answered from the registry fetch, which has already finished, so its row costs nothing to
+// open; one with collections has to wait for them to be fetched.
+func chooseOrgTemplates(
+	org string, t guidedTemplates, opts display.Options, sel selectFunc,
+) (cmdTemplates.Template, error) {
+	available := t.registry
+	if slices.Contains(t.vcsOrgs, org) {
+		all, err := t.fetchAll()
+		if err != nil {
+			return nil, stepBack(opts, "Could not load templates for organization %q: %v", org, err)
+		}
+		available = all
+	}
+
+	var orgTemplates []cmdTemplates.Template
+	for _, template := range available {
+		if publisher, ok := registryPublisher(template); ok && publisher == org {
+			orgTemplates = append(orgTemplates, template)
+		}
+	}
+	if len(orgTemplates) == 0 {
+		return nil, stepBack(opts, "No templates found for organization %q.", org)
+	}
+	return chooseTemplateFromList(orgTemplates, opts, sel)
 }
 
 func chooseTemplateFromList(

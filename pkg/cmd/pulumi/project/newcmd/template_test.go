@@ -60,37 +60,51 @@ func TestChooseTemplateNonInteractiveReturnsNil(t *testing.T) {
 	assert.Nil(t, got)
 }
 
-func TestTemplateChooserPicksGuidedOnlyWhenNothingIsNamed(t *testing.T) {
+// fakeSource is a guidedTemplateSource with independently controllable fetches.
+type fakeSource struct {
+	project     []cmdTemplates.Template
+	registry    []cmdTemplates.Template
+	vcsOrgs     []string
+	all         []cmdTemplates.Template
+	projectErr  error
+	registryErr error
+	allErr      error
+}
+
+func (f fakeSource) ProjectTemplates() ([]cmdTemplates.Template, error) {
+	return f.project, f.projectErr
+}
+
+func (f fakeSource) RegistryTemplates() ([]cmdTemplates.Template, error) {
+	return f.registry, f.registryErr
+}
+
+func (f fakeSource) VcsTemplateSourceOrgs() []string             { return f.vcsOrgs }
+func (f fakeSource) Templates() ([]cmdTemplates.Template, error) { return f.all, f.allErr }
+
+// sourceOf builds a fakeSource whose project fetch carries every template, as the local checkout
+// does when nothing has been published to the registry.
+func sourceOf(templates ...cmdTemplates.Template) fakeSource {
+	return fakeSource{project: templates, all: templates}
+}
+
+func TestUseGuidedFlowOnlyWhenNothingIsNamed(t *testing.T) {
 	t.Parallel()
 
-	flat := func([]cmdTemplates.Template, display.Options) (cmdTemplates.Template, error) {
-		return fakeTemplate{name: "flat"}, nil
-	}
-	guided := func([]cmdTemplates.Template, display.Options) (cmdTemplates.Template, error) {
-		return fakeTemplate{name: "guided"}, nil
-	}
-
 	tests := []struct {
-		name              string
-		templateNameOrURL string
-		expected          string
+		name string
+		args newArgs
+		want bool
 	}{
-		{"nothing named", "", "guided"},
-		{"template named", "aws-typescript", "flat"},
-		{"url named", "https://github.com/pulumi/examples", "flat"},
+		{"nothing named", newArgs{}, true},
+		{"template named", newArgs{templateNameOrURL: "aws-typescript"}, false},
+		{"url named", newArgs{templateNameOrURL: "https://github.com/pulumi/examples"}, false},
+		{"auto-accept", newArgs{yes: true}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			args := newArgs{
-				chooseTemplate:       flat,
-				chooseTemplateGuided: guided,
-				templateNameOrURL:    tt.templateNameOrURL,
-			}
-			got, err := args.templateChooser()(nil, display.Options{})
-			require.NoError(t, err)
-			assert.Equal(t, tt.expected, got.Name())
+			assert.Equal(t, tt.want, tt.args.useGuidedFlow())
 		})
 	}
 }
@@ -111,13 +125,38 @@ func TestGuidedChooserFallsBackToFlatWhenNothingIsCurated(t *testing.T) {
 	// A name the catalog can't decompose yields no providers, so guided must defer to the flat list.
 	var notice bytes.Buffer
 	got, err := guidedChooser(sel, flat)(
-		[]cmdTemplates.Template{fakeTemplate{name: "unparseable"}},
+		sourceOf(fakeTemplate{name: "unparseable"}, fakeTemplate{name: "second"}),
 		display.Options{IsInteractive: true, Stdout: &notice},
 	)
 	require.NoError(t, err)
 	assert.True(t, flatCalled)
 	assert.Equal(t, "flat", got.Name())
 	assert.Contains(t, notice.String(), "Falling back to the full template list.")
+}
+
+func TestGuidedChooserFallbackHandlesTinyTemplateSets(t *testing.T) {
+	t.Parallel()
+
+	flat := func([]cmdTemplates.Template, display.Options) (cmdTemplates.Template, error) {
+		t.Error("the flat chooser must not run for zero or one template")
+		return nil, nil
+	}
+	sel := func(string, []string, display.Options) (int, error) {
+		t.Error("no prompt may be shown for zero or one template")
+		return 0, nil
+	}
+
+	_, err := guidedChooser(sel, flat)(
+		fakeSource{}, display.Options{IsInteractive: true},
+	)
+	assert.ErrorContains(t, err, "no templates")
+
+	only := fakeTemplate{name: "unparseable"}
+	got, err := guidedChooser(sel, flat)(
+		sourceOf(only), display.Options{IsInteractive: true},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "unparseable", got.Name(), "a single template is chosen without prompting")
 }
 
 func TestGuidedChooserBrowseAllListsInline(t *testing.T) {
@@ -130,7 +169,7 @@ func TestGuidedChooserBrowseAllListsInline(t *testing.T) {
 	sel, _ := scriptedSelect(t, optionBrowseAll, "aws-typescript    ")
 
 	got, err := guidedChooser(sel, flat)(
-		[]cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}},
+		sourceOf(fakeTemplate{name: "aws-typescript"}),
 		display.Options{IsInteractive: true},
 	)
 	require.NoError(t, err)
@@ -149,7 +188,7 @@ func TestGuidedChooserMapsInterruptToNoTemplateSelected(t *testing.T) {
 	}
 
 	got, err := guidedChooser(sel, flat)(
-		[]cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}},
+		sourceOf(fakeTemplate{name: "aws-typescript"}),
 		display.Options{IsInteractive: true},
 	)
 	assert.Nil(t, got)
@@ -166,7 +205,7 @@ func TestGuidedChooserReturnsGuidedTemplateWithoutFlat(t *testing.T) {
 	sel, _ := scriptedSelect(t, "AWS", "TypeScript")
 
 	got, err := guidedChooser(sel, flat)(
-		[]cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}},
+		sourceOf(fakeTemplate{name: "aws-typescript"}),
 		display.Options{IsInteractive: true},
 	)
 	require.NoError(t, err)
@@ -185,7 +224,7 @@ func TestGuidedChooserPropagatesErrors(t *testing.T) {
 	}
 
 	_, err := guidedChooser(sel, flat)(
-		[]cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}},
+		sourceOf(fakeTemplate{name: "aws-typescript"}),
 		display.Options{IsInteractive: true},
 	)
 	assert.ErrorContains(t, err, "boom")
@@ -200,7 +239,7 @@ func TestGuidedChooserNonInteractiveReturnsNil(t *testing.T) {
 	}
 
 	got, err := guidedChooser(sel, ChooseTemplate)(
-		[]cmdTemplates.Template{fakeTemplate{name: "aws-typescript"}},
+		sourceOf(fakeTemplate{name: "aws-typescript"}),
 		display.Options{IsInteractive: false},
 	)
 	require.NoError(t, err)

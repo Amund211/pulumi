@@ -29,8 +29,8 @@ type getProjectTemplateFunc = func(ctx context.Context, templateNamePathOrURL st
 ) (TemplateRepository, error)
 
 func (s *Source) getProjectTemplates(
-	ctx context.Context, templateNamePathOrURL string, scope SearchScope, templateKind TemplateKind,
-	get getProjectTemplateFunc,
+	ctx context.Context, f *fetch, templateNamePathOrURL string, scope SearchScope,
+	templateKind TemplateKind, get getProjectTemplateFunc,
 ) {
 	repo, err := get(ctx, templateNamePathOrURL, scope == ScopeLocal, templateKind)
 	if err != nil {
@@ -40,7 +40,7 @@ func (s *Source) getProjectTemplates(
 		}
 		// Bail on all errors unless its a 401 from a Pulumi Cloud backend...
 		if !errors.Is(err, ErrPulumiCloudUnauthorized) {
-			s.addError(err)
+			f.addError(err)
 			return
 		}
 
@@ -48,18 +48,18 @@ func (s *Source) getProjectTemplates(
 		// attempt to retrieve the template using the user's Pulumi Cloud credentials.
 		repo, err = retrievePrivatePulumiCloudTemplate(templateNamePathOrURL)
 		if err != nil {
-			s.addError(err)
+			f.addError(err)
 			return
 		}
 	}
 	s.addCloser(repo.Delete)
 	projectTemplates, err := repo.Templates()
 	if err != nil {
-		s.addError(fmt.Errorf("could not get template from workspace: %w", err))
+		f.addError(fmt.Errorf("could not get template from workspace: %w", err))
 		return
 	}
 
-	s.addDownloadedTemplates(projectTemplates)
+	f.addDownloadedTemplates(projectTemplates)
 }
 
 // Retrieve a Private template from the given Pulumi Cloud URL **including an auth token for Pulumi Cloud**.
@@ -100,9 +100,9 @@ func retrievePrivatePulumiCloudTemplate(templateURL string) (TemplateRepository,
 	return templateRepository, err
 }
 
-func (s *Source) addDownloadedTemplates(src []ProjectTemplate) {
+func (f *fetch) addDownloadedTemplates(src []ProjectTemplate) {
 	for _, t := range src {
-		s.addTemplate(projectTemplate{t})
+		f.addTemplate(projectTemplate{t})
 	}
 }
 
@@ -112,11 +112,11 @@ type projectTemplate struct {
 	t ProjectTemplate
 }
 
-func (t projectTemplate) Name() string              { return t.t.Name }
-func (t projectTemplate) DisplayName() string       { return t.t.Name }
-func (t projectTemplate) Description() string       { return t.t.Description }
-func (t projectTemplate) Error() error              { return t.t.Error }
-func (t projectTemplate) Publisher() (string, bool) { return "", false }
+func (t projectTemplate) Name() string        { return t.t.Name }
+func (t projectTemplate) DisplayName() string { return t.t.Name }
+func (t projectTemplate) Description() string { return t.t.Description }
+func (t projectTemplate) Error() error        { return t.t.Error }
+func (t projectTemplate) Publisher() string   { return "" }
 func (t projectTemplate) Download(ctx context.Context) (ProjectTemplate, error) {
 	return t.t, nil
 }
